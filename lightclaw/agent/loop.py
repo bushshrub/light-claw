@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from lightclaw.config import Config, get_config
@@ -13,7 +14,6 @@ from lightclaw.llm import LLMClient
 from lightclaw import log
 from lightclaw.memory import Workspace
 from lightclaw.tools.registry import Registry, get_default_registry
-
 
 class AgentLoop:
     def __init__(
@@ -104,6 +104,48 @@ class AgentLoop:
             chunks.append(chunk)
         return "".join(chunks)
 
+    async def compact_history(
+        self,
+        thread_id: str = "default",
+        on_progress: Callable[[str], None] | None = None,
+    ) -> int:
+        """Summarise conversation history into one message. Returns messages removed."""
+        if not self._workspace:
+            return 0
+        history = await self._workspace.get_history(thread_id)
+        if len(history) < 4:
+            return 0
+        n = len(history)
+        if on_progress:
+            on_progress(f"summarising {n} messages...")
+        msgs: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "Summarise the following conversation into a single concise paragraph, "
+                    "preserving all important context, decisions, and facts."
+                ),
+            }
+        ]
+        msgs.extend(history)
+        try:
+            resp = await self._llm.chat(msgs)
+            summary = resp.choices[0].message.content or ""
+        except Exception as exc:
+            if on_progress:
+                on_progress(f"error: {exc}")
+            return 0
+        if on_progress:
+            on_progress("replacing history with summary...")
+        await self._workspace.clear_history(thread_id)
+        await self._workspace.add_message(
+            "assistant",
+            f"[Conversation summary — {n} previous messages]\n\n{summary}",
+            thread_id,
+        )
+        self._tokens = {"prompt": 0, "completion": 0, "total": 0}
+        return n
+
     async def stream(
         self,
         user_message: str,
@@ -133,104 +175,110 @@ class AgentLoop:
         if self._context_length is None:
             self._context_length = await self._llm.fetch_context_length()
 
-        while rounds < self._cfg.max_tool_rounds:
-            rounds += 1
+        _agent_token = _current_agent.set(self)
+        try:
+            while rounds < self._cfg.max_tool_rounds:
+                rounds += 1
 
-            if log._enabled(log.DEBUG):
-                for m in messages:
-                    role = m.get("role", "?")
-                    content = m.get("content") or ""
-                    preview = (content[:120] + "…") if len(content) > 120 else content
-                    log.debug(f"[{role}] {preview!r}")
+                if log._enabled(log.DEBUG):
+                    for m in messages:
+                        role = m.get("role", "?")
+                        content = m.get("content") or ""
+                        preview = (content[:120] + "…") if len(content) > 120 else content
+                        log.debug(f"[{role}] {preview!r}")
 
-            text_parts: list[str] = []
-            tool_call_acc: dict[int, dict[str, Any]] = {}
+                text_parts: list[str] = []
+                tool_call_acc: dict[int, dict[str, Any]] = {}
 
-            resp = await self._llm.chat_stream(messages, tools=tools or None)
-            async for chunk in resp:
-                # Usage arrives in the final chunk (stream_options.include_usage)
-                if chunk.usage:
-                    self._tokens["prompt"] += chunk.usage.prompt_tokens or 0
-                    self._tokens["completion"] += chunk.usage.completion_tokens or 0
-                    self._tokens["total"] += chunk.usage.total_tokens or 0
+                resp = await self._llm.chat_stream(messages, tools=tools or None)
+                async for chunk in resp:
+                    if chunk.usage:
+                        self._tokens["prompt"] += chunk.usage.prompt_tokens or 0
+                        self._tokens["completion"] += chunk.usage.completion_tokens or 0
+                        self._tokens["total"] += chunk.usage.total_tokens or 0
 
-                if not chunk.choices:
-                    continue
+                    if not chunk.choices:
+                        continue
 
-                delta = chunk.choices[0].delta
+                    delta = chunk.choices[0].delta
 
-                if delta.content:
-                    text_parts.append(delta.content)
-                    yield delta.content
+                    if delta.content:
+                        text_parts.append(delta.content)
+                        yield delta.content
 
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tool_call_acc:
-                            fn = tc_delta.function
-                            tool_call_acc[idx] = {
-                                "id": tc_delta.id or "",
-                                "type": "function",
-                                "function": {
-                                    "name": fn.name or "" if fn else "",
-                                    "arguments": fn.arguments or "" if fn else "",
-                                },
-                            }
-                        else:
-                            if tc_delta.id:
-                                tool_call_acc[idx]["id"] = tc_delta.id
-                            fn = tc_delta.function
-                            if fn:
-                                if fn.name:
-                                    tool_call_acc[idx]["function"]["name"] += fn.name
-                                if fn.arguments:
-                                    tool_call_acc[idx]["function"]["arguments"] += fn.arguments
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_call_acc:
+                                fn = tc_delta.function
+                                tool_call_acc[idx] = {
+                                    "id": tc_delta.id or "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": fn.name or "" if fn else "",
+                                        "arguments": fn.arguments or "" if fn else "",
+                                    },
+                                }
+                            else:
+                                if tc_delta.id:
+                                    tool_call_acc[idx]["id"] = tc_delta.id
+                                fn = tc_delta.function
+                                if fn:
+                                    if fn.name:
+                                        tool_call_acc[idx]["function"]["name"] += fn.name
+                                    if fn.arguments:
+                                        tool_call_acc[idx]["function"]["arguments"] += fn.arguments
 
-            full_text = "".join(text_parts)
+                full_text = "".join(text_parts)
 
-            if log._enabled(log.DEBUG):
-                if tool_call_acc:
-                    for tc in sorted(tool_call_acc.values(), key=lambda t: t["id"]):
-                        log.debug(f"← tool_call {tc['function']['name']}({tc['function']['arguments']})")
-                else:
-                    log.debug(f"← assistant {full_text[:120]!r}")
+                if log._enabled(log.DEBUG):
+                    if tool_call_acc:
+                        for tc in sorted(tool_call_acc.values(), key=lambda t: t["id"]):
+                            log.debug(f"← tool_call {tc['function']['name']}({tc['function']['arguments']})")
+                    else:
+                        log.debug(f"← assistant {full_text[:120]!r}")
 
-            # No tool calls → final answer (chunks already yielded)
-            if not tool_call_acc:
-                if self._workspace:
-                    await self._workspace.add_message("assistant", full_text, thread_id)
-                return
+                if not tool_call_acc:
+                    if self._workspace:
+                        await self._workspace.add_message("assistant", full_text, thread_id)
+                    return
 
-            # Tool calls → append assistant message and execute (in parallel)
-            tool_calls_list = [tool_call_acc[i] for i in sorted(tool_call_acc)]
-            messages.append({
-                "role": "assistant",
-                "content": full_text or None,
-                "tool_calls": tool_calls_list,
-            })
-
-            async def _call_tool(tc: dict[str, Any]) -> tuple[str, str]:
-                name = tc["function"]["name"]
-                args = tc["function"]["arguments"]
-                log.info(f"tool {name}  args={args}")
-                try:
-                    result = await self._registry.call(name, args)
-                    result_str = (
-                        json.dumps(result) if not isinstance(result, str) else result
-                    )
-                except Exception as exc:
-                    result_str = f"Error: {exc}"
-                return tc["id"], result_str
-
-            tool_results = await asyncio.gather(*[_call_tool(tc) for tc in tool_calls_list])
-            for tool_id, result_str in tool_results:
+                tool_calls_list = [tool_call_acc[i] for i in sorted(tool_call_acc)]
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "content": result_str,
+                    "role": "assistant",
+                    "content": full_text or None,
+                    "tool_calls": tool_calls_list,
                 })
 
-        fallback = "[max tool rounds reached]"
-        if self._workspace:
-            await self._workspace.add_message("assistant", fallback, thread_id)
-        yield fallback
+                async def _call_tool(tc: dict[str, Any]) -> tuple[str, str]:
+                    name = tc["function"]["name"]
+                    args = tc["function"]["arguments"]
+                    log.info(f"tool {name}  args={args}")
+                    try:
+                        result = await self._registry.call(name, args)
+                        result_str = (
+                            json.dumps(result) if not isinstance(result, str) else result
+                        )
+                    except Exception as exc:
+                        result_str = f"Error: {exc}"
+                    return tc["id"], result_str
+
+                tool_results = await asyncio.gather(*[_call_tool(tc) for tc in tool_calls_list])
+                for tool_id, result_str in tool_results:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": result_str,
+                    })
+
+            fallback = "[max tool rounds reached]"
+            if self._workspace:
+                await self._workspace.add_message("assistant", fallback, thread_id)
+            yield fallback
+        finally:
+            _current_agent.reset(_agent_token)
+
+
+_current_agent: contextvars.ContextVar["AgentLoop | None"] = contextvars.ContextVar(
+    "_current_agent", default=None
+)

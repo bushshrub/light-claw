@@ -335,6 +335,50 @@ async def lightclaw_system_report_issue(
 
 
 # ---------------------------------------------------------------------------
+# Token usage + compaction tools
+# ---------------------------------------------------------------------------
+
+@_reg.tool(
+    description=(
+        "Get current session token usage and context window utilisation. "
+        "Returns prompt/completion/total tokens, context length, and % used. "
+        "Call this to check if the conversation is approaching the context limit."
+    )
+)
+def get_token_usage() -> dict:
+    from lightclaw.agent.loop import _current_agent
+    agent = _current_agent.get()
+    if agent is None:
+        return {"error": "no active agent"}
+    stats = agent.token_stats
+    ctx = agent.context_length or 128_000
+    pct = stats["total"] / ctx * 100 if stats["total"] else 0.0
+    return {
+        **stats,
+        "context_length": ctx,
+        "context_used_pct": round(pct, 1),
+    }
+
+
+@_reg.tool(
+    description=(
+        "Compact the current conversation history by summarising it into a single "
+        "message. Frees up context window space. Use when context is above ~75%. "
+        "Returns the number of messages compacted and resets the token counter."
+    )
+)
+async def compact_conversation(thread_id: str = "default") -> str:
+    from lightclaw.agent.loop import _current_agent
+    agent = _current_agent.get()
+    if agent is None:
+        return "No active agent"
+    n = await agent.compact_history(thread_id)
+    if n == 0:
+        return "Nothing to compact (fewer than 4 messages)"
+    return f"Compacted {n} messages. Token counter reset."
+
+
+# ---------------------------------------------------------------------------
 # Self-introspection tool
 # ---------------------------------------------------------------------------
 

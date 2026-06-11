@@ -33,6 +33,19 @@ lightclaw/
 
 lightclaw-tools/
 └── opencode/              MCP server exposing opencode in a Docker sandbox
+
+lightclaw-webui/           SvelteKit web UI (pnpm, Svelte 5 + TypeScript)
+├── src/routes/+page.svelte   Main chat page
+├── src/lib/api.ts            API client (SSE streaming, history, memory, tools)
+├── src/lib/markdown.ts       marked + highlight.js renderer
+├── src/lib/components/
+│   ├── ChatMessage.svelte    Single message with markdown/image rendering
+│   ├── StatusBar.svelte      Token usage bar (mirrors REPL toolbar)
+│   └── Modal.svelte          Generic modal dialog
+└── build/                    Production build (served by FastAPI)
+
+lightclaw/web/
+└── server.py          FastAPI server: SSE /api/chat, history, memory, tools, upload
 ```
 
 ## Running
@@ -46,6 +59,15 @@ uv run lightclaw run "summarise my notes"
 
 # Discord bot
 DISCORD_BOT_TOKEN=... uv run lightclaw discord
+
+# Web UI (build frontend first, then start server)
+cd lightclaw-webui && pnpm build && cd ..
+uv run lightclaw web                     # serves at http://127.0.0.1:8000
+uv run lightclaw web --port 3000         # custom port
+
+# Dev mode (frontend hot-reload + FastAPI backend)
+uv run lightclaw web &                   # backend on :8000
+cd lightclaw-webui && pnpm dev           # vite on :5173, proxies /api → :8000
 
 # MCP management
 uv run lightclaw mcp add filesystem --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg /Users/you

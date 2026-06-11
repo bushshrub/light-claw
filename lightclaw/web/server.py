@@ -20,7 +20,7 @@ from lightclaw.memory import Workspace
 from lightclaw.mcp import MCPManager
 from lightclaw.tools.registry import get_default_registry
 
-WEBUI_DIR = Path(__file__).parent.parent.parent / "lightclaw-webui"
+WEBUI_DIR = Path(__file__).parent.parent.parent / "lightclaw-webui" / "build"
 
 
 class ChatRequest(BaseModel):
@@ -35,21 +35,29 @@ class MemorySetRequest(BaseModel):
 
 
 class WebSession:
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        workspace: Workspace | None = None,
+        registry=None,
+    ) -> None:
         self.config = config
-        self.workspace = Workspace(config)
-        self.registry = get_default_registry()
+        self._owns_workspace = workspace is None
+        self.workspace = workspace if workspace is not None else Workspace(config)
+        self.registry = registry if registry is not None else get_default_registry()
         self.mcp = MCPManager()
         self.agent = AgentLoop(config, self.registry, self.workspace)
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
-        await self.workspace.open()
+        if self._owns_workspace:
+            await self.workspace.open()
         await self.mcp.start(self.registry)
 
     async def stop(self) -> None:
         await self.mcp.stop()
-        await self.workspace.close()
+        if self._owns_workspace:
+            await self.workspace.close()
 
 
 _session: WebSession | None = None
@@ -61,10 +69,14 @@ def _get() -> WebSession:
     return _session
 
 
-def create_app(config: Config | None = None) -> FastAPI:
+def create_app(
+    config: Config | None = None,
+    workspace: Workspace | None = None,
+    registry=None,
+) -> FastAPI:
     global _session
     cfg = config or get_config()
-    _session = WebSession(cfg)
+    _session = WebSession(cfg, workspace=workspace, registry=registry)
 
     app = FastAPI(title="light-claw")
     app.add_middleware(

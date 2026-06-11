@@ -15,6 +15,7 @@ Local agent OS — Python reimplementation of [ironclaw](https://github.com/near
 
 - **Agentic loop** — LLM drives tool calls until task complete
 - **Persistent memory** — SQLite + FTS5 workspace: conversation history and searchable notes
+- **Web UI** — SvelteKit chat interface with streaming markdown, image paste, and live sync with the REPL
 - **Shell tool** — gated behind a two-tier approval system (denylist + interactive whitelist)
 - **MCP support** — attach any stdio MCP server; tools appear automatically
 - **Scheduler** — cron and interval jobs via APScheduler
@@ -50,6 +51,48 @@ uv run lightclaw mcp list
 uv run lightclaw mcp tools filesystem
 uv run lightclaw mcp remove filesystem
 ```
+
+## Web UI
+
+light-claw includes a SvelteKit chat interface with streaming markdown, syntax highlighting, image paste, and live thread sync with the REPL.
+
+### Build the frontend (once, or after UI changes)
+
+Requires [Node.js](https://nodejs.org) and [pnpm](https://pnpm.io).
+
+```bash
+cd lightclaw-webui
+pnpm install
+pnpm build
+cd ..
+```
+
+### Run standalone
+
+```bash
+uv run lightclaw web                  # http://127.0.0.1:8000
+uv run lightclaw web --port 3000      # custom port
+uv run lightclaw web --host 0.0.0.0  # listen on all interfaces
+```
+
+### Enable from inside the REPL
+
+```
+/connectors enable web     → starts at http://127.0.0.1:8000
+/connectors disable web    → stops it
+/connectors list           → shows status
+```
+
+Port and host can be overridden with `LIGHTCLAW_WEB_PORT` and `LIGHTCLAW_WEB_HOST` env vars.
+
+### Development (hot-reload)
+
+```bash
+uv run lightclaw web &             # FastAPI backend on :8000
+cd lightclaw-webui && pnpm dev     # Vite on :5173, proxies /api → :8000
+```
+
+The web UI shares the REPL's workspace when started as a connector — messages sent in either interface appear in both within ~2 seconds (the UI polls for updates).
 
 ## Configuration
 

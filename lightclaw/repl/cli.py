@@ -9,22 +9,13 @@ import platform
 import re
 import subprocess
 import tempfile
-import time
 from typing import Annotated, Any
 
 import typer
-from prompt_toolkit import PromptSession as _PTSession
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.formatted_text import HTML as _HTML
-from prompt_toolkit.key_binding import KeyBindings as _KB
-from prompt_toolkit.styles import Style as _PTStyle
-from rich.console import Group
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
-from rich.text import Text
 
 from lightclaw.agent import AgentLoop
 from lightclaw.config import Config, config_dir, get_config, set_config
@@ -132,53 +123,6 @@ def _read_clipboard_image() -> tuple[bytes, str] | None:
     return None
 
 
-class _SlashCompleter(Completer):
-    _CMDS: list[tuple[str, str]] = [
-        ("/clear",          "clear conversation history"),
-        ("/help",           "show help"),
-        ("/history",        "show conversation history"),
-        ("/jobs cancel ",   "/jobs cancel <id>"),
-        ("/jobs list",      "list background jobs"),
-        ("/jobs logs ",     "/jobs logs <id>"),
-        ("/jobs run ",      "/jobs run <prompt>"),
-        ("/memory del ",    "/memory del <key>"),
-        ("/memory list",    "list stored notes"),
-        ("/memory search ", "/memory search <q>"),
-        ("/memory set ",    "/memory set <key> <value>"),
-        ("/model",          "show model info"),
-        ("/paste",          "paste image from clipboard"),
-        ("/paste clear",    "clear pending image attachments"),
-        ("/quit",           "exit"),
-        ("/routines list",   "list routines"),
-        ("/routines run ",   "/routines run <id>"),
-        ("/schedule add ",   "/schedule add <id> <cron> <prompt>"),
-        ("/skills install ", "/skills install <id>"),
-        ("/skills list",     "list installed skills"),
-        ("/skills remove ",  "/skills remove <id>"),
-        ("/skills run ",     "/skills run <id> [key=val ...]"),
-        ("/skills search ",  "/skills search <query>"),
-        ("/schedule list",  "list scheduled tasks"),
-        ("/schedule rm ",   "/schedule rm <id>"),
-        ("/session",        "show token usage"),
-        ("/suggest",        "ask the agent to analyse its source and suggest improvements"),
-        ("/thread ",        "/thread <id>"),
-        ("/tools",          "list registered tools"),
-    ]
-
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        if not text.startswith("/"):
-            return
-        for insert, desc in self._CMDS:
-            if insert.startswith(text):
-                yield Completion(
-                    insert,
-                    start_position=-len(text),
-                    display=insert.rstrip(),
-                    display_meta=desc,
-                )
-
-
 app = typer.Typer(help="light-claw: local agent OS", no_args_is_help=False)
 mcp_app = typer.Typer(help="Manage MCP servers")
 jobs_app = typer.Typer(help="Background jobs")
@@ -219,7 +163,8 @@ SLASH_HELP = """
                                  schedule agent prompt on cron
   [cyan]/schedule rm <id>[/cyan]              remove scheduled task
   [cyan]/suggest[/cyan]                       ask the agent to analyse its source and suggest improvements
-  [cyan]/connectors list[/cyan]              list connectors (discord, signal) and status
+  [cyan]/connectors list[/cyan]              list connectors (discord, signal, web) and status
+  [cyan]/connectors enable web[/cyan]        start web UI (http://127.0.0.1:8000 by default)
   [cyan]/connectors enable <name>[/cyan]     start a connector in the background
   [cyan]/connectors disable <name>[/cyan]    stop a running connector
   [cyan]/thread <id>[/cyan]                   switch conversation thread
@@ -231,11 +176,11 @@ SLASH_HELP = """
   Attach files directly with [cyan]@/absolute/path[/cyan] in your message.
 """
 
-_CONNECTOR_NAMES = ("discord", "signal")
+_CONNECTOR_NAMES = ("discord", "signal", "web")
 
 
 class _ConnectorManager:
-    """Manages background connector (Discord, Signal) tasks within the REPL."""
+    """Manages background connector (Discord, Signal, web) tasks within the REPL."""
 
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
@@ -276,6 +221,23 @@ class _ConnectorManager:
             self._entries["signal"] = {"bot": bot, "task": task}
             return "signal connector started"
 
+        if name == "web":
+            import uvicorn
+            from lightclaw.web.server import create_app
+            host = os.environ.get("LIGHTCLAW_WEB_HOST", "127.0.0.1")
+            port = int(os.environ.get("LIGHTCLAW_WEB_PORT", "8000"))
+            uv_cfg = uvicorn.Config(
+                create_app(cfg, workspace=workspace, registry=registry),
+                host=host,
+                port=port,
+                log_level="warning",
+                loop="none",
+            )
+            server = uvicorn.Server(uv_cfg)
+            task = asyncio.create_task(server.serve(), name="connector_web")
+            self._entries["web"] = {"server": server, "task": task}
+            return f"web UI started at http://{host}:{port}"
+
         return f"unknown connector {name!r} — available: {', '.join(_CONNECTOR_NAMES)}"
 
     async def disable(self, name: str) -> str:
@@ -284,7 +246,10 @@ class _ConnectorManager:
         if self.status(name) != "running":
             return f"{name} is not running"
         entry = self._entries[name]
-        await entry["bot"].close()
+        if "server" in entry:
+            entry["server"].should_exit = True
+        else:
+            await entry["bot"].close()
         entry["task"].cancel()
         return f"{name} connector stopped"
 
@@ -292,8 +257,12 @@ class _ConnectorManager:
         for name in list(self._entries):
             if self.status(name) == "running":
                 try:
-                    await self._entries[name]["bot"].close()
-                    self._entries[name]["task"].cancel()
+                    entry = self._entries[name]
+                    if "server" in entry:
+                        entry["server"].should_exit = True
+                    else:
+                        await entry["bot"].close()
+                    entry["task"].cancel()
                 except Exception:
                     pass
 
@@ -640,258 +609,15 @@ def _make_image_attachment(data: bytes, mime: str) -> dict[str, Any]:
     }
 
 
-async def _repl(config: Config) -> None:
+async def _repl_tui(config: Config) -> None:
+    """Launch Textual TUI REPL."""
+    from lightclaw.repl.tui import run_tui
     session = ReplSession(config)
     await session.start()
-
-    console.print(Panel(
-        "[bold cyan]light-claw[/bold cyan]  local agent OS\n"
-        f"model=[yellow]{config.model}[/yellow]  "
-        f"base=[yellow]{config.base_url}[/yellow]  "
-        f"db=[yellow]{config.db_path}[/yellow]\n"
-        "Type [cyan]/help[/cyan] for commands or [cyan]/quit[/cyan] to exit.\n"
-        "Paste images with [cyan]Ctrl+Y[/cyan] or [cyan]/paste[/cyan].",
-        title="light-claw",
-        border_style="cyan",
-    ))
-
-    _pending_image_attachments: list[dict[str, Any]] = []
-
-    def _toolbar() -> _HTML:
-        stats = session.agent.token_stats
-        total = stats.get("total", 0)
-        ctx_known = session.agent.context_length is not None
-        ctx = session.agent.context_length or 128_000
-        pct = min(total / ctx * 100, 100) if total else 0.0
-        bar_w = 20
-        filled = round(pct / 100 * bar_w)
-        bar = "█" * filled + " " * (bar_w - filled)
-        color = "ansigreen" if pct < 50 else "ansiyellow" if pct < 80 else "ansired"
-        est = "~" if not ctx_known else ""
-        tok_label = f"{est}{total/1000:.1f}K/{ctx/1000:.1f}K"
-        ttft_str = f"  ttft {session.last_ttft:.2f}s" if session.last_ttft is not None else ""
-        attach_str = f"  📎 {len(_pending_image_attachments)}" if _pending_image_attachments else ""
-        return _HTML(
-            f" {tok_label}"
-            f"  [<style fg='{color}'>{bar}</style>]"
-            f"{ttft_str}{attach_str}"
-        )
-
-    def _routines_panel() -> Text:
-        t = Text()
-        t.append("jobs\n", style="cyan bold")
-        t.append("─" * 20 + "\n", style="dim")
-        jobs = session.job_manager.list_all(limit=8)
-        for j in jobs:
-            if j.status == "completed":
-                icon, style = "✓", "green"
-            elif j.status == "failed":
-                icon, style = "✗", "red"
-            else:
-                icon, style = "⏳", "cyan"
-            name = j.id if len(j.id) <= 20 else j.id[:17] + "..."
-            t.append(f"{icon} ", style=style)
-            t.append(f"{name}\n", style="dim")
-            t.append(f"  {j.elapsed}\n", style="dim")
-        if not jobs:
-            t.append("no jobs yet", style="dim")
-        return t
-
-    kb = _KB()
-
-    @kb.add("c-y")
-    def _paste_image_from_clipboard(event) -> None:
-        result = _read_clipboard_image()
-        if result is not None:
-            data, mime = result
-            _pending_image_attachments.append(_make_image_attachment(data, mime))
-            event.app.invalidate()
-
-    pt_session: _PTSession = _PTSession(
-        completer=_SlashCompleter(),
-        bottom_toolbar=_toolbar,
-        complete_while_typing=True,
-        complete_in_thread=True,
-        key_bindings=kb,
-        style=_PTStyle.from_dict({
-            "bottom-toolbar": "noreverse bg:#111111 #666666",
-            "bottom-toolbar.text": "noreverse bg:#111111 #666666",
-        }),
-    )
-
     try:
-        while True:
-            try:
-                line = await pt_session.prompt_async(
-                    _HTML(f"<ansibrightcyan><b>({session.thread_id})</b></ansibrightcyan> "),
-                )
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not line.strip():
-                continue
-
-            # Handle /paste before generic slash dispatch (needs _pending_image_attachments).
-            if line.strip().lower().startswith("/paste"):
-                sub = line.strip().split(None, 1)[1].lower() if len(line.strip().split(None)) > 1 else ""
-                if sub == "clear":
-                    _pending_image_attachments.clear()
-                    console.print("[yellow]Pending attachments cleared.[/yellow]")
-                else:
-                    result = await asyncio.to_thread(_read_clipboard_image)
-                    if result is not None:
-                        data, mime = result
-                        _pending_image_attachments.append(_make_image_attachment(data, mime))
-                        n = len(_pending_image_attachments)
-                        console.print(
-                            f"[green]Attached[/green] {mime} image "
-                            f"({len(data):,} bytes)  —  {n} pending"
-                        )
-                    else:
-                        console.print("[yellow]No image in clipboard.[/yellow]")
-                continue
-
-            # /suggest — replace with a canned analysis prompt, then fall through to agent.
-            if line.strip().lower() == "/suggest":
-                line = (
-                    "Use lightclaw_read_source to explore your own source code and identify "
-                    "concrete improvements. Start with the project structure (''), then read "
-                    "the most relevant modules. Produce a prioritised list of 3–5 specific, "
-                    "actionable suggestions (bugs first, then UX friction, then missing "
-                    "features). For each: state what the problem is, where in the code it "
-                    "lives, and what the fix would be."
-                )
-                # fall through to agent stream below
-
-            if line.startswith("/"):
-                try:
-                    await session.handle_slash(line)
-                except KeyboardInterrupt:
-                    break
-                continue
-
-            line, text_attachments = _parse_attachments(line)
-            all_attachments = list(_pending_image_attachments) + text_attachments
-            _pending_image_attachments.clear()
-
-            if not line and not all_attachments:
-                continue
-
-            stats_before = dict(session.agent.token_stats)
-            start_time = time.perf_counter()
-            first_token_time: float | None = None
-            response_text = ""
-            chunk_chars = 0
-
-            def _status_line(exact_msg: int | None = None) -> Text:
-                ctx_known = session.agent.context_length is not None
-                ctx = session.agent.context_length or 128_000
-                stats = session.agent.token_stats
-                session_total = stats.get("total", 0)
-                ttft = f"{first_token_time:.2f}s" if first_token_time is not None else "—"
-                if exact_msg is not None:
-                    tok_part = f"{exact_msg:,} tok"
-                else:
-                    approx = max(1, chunk_chars // 4)
-                    tok_part = f"~{approx:,} tok"
-                pct = min(session_total / ctx * 100, 100)
-                bar_width = 20
-                filled = round(pct / 100 * bar_width)
-                bar = "█" * filled + " " * (bar_width - filled)
-                bar_style = "green" if pct < 50 else "yellow" if pct < 80 else "red"
-                est = "~" if not ctx_known else ""
-                tok_label = f"{est}{session_total/1000:.1f}K/{ctx/1000:.1f}K"
-                line = Text(style="dim")
-                line.append(f"ttft {ttft}  {tok_part}  {tok_label}  ")
-                line.append("[", style="dim")
-                line.append(bar, style=bar_style)
-                line.append("]", style="dim")
-                return line
-
-            live = Live(console=console, refresh_per_second=15)
-            live.start()
-            _live_stopped = False
-
-            def _live_grid(main, sidebar) -> Table:
-                grid = Table.grid(padding=(0, 1), expand=True)
-                grid.add_column(ratio=3)
-                grid.add_column(ratio=1, min_width=22)
-                grid.add_row(main, sidebar)
-                return grid
-
-            async def _tick() -> None:
-                while first_token_time is None:
-                    elapsed = time.perf_counter() - start_time
-                    live.update(_live_grid(
-                        Text(f"⏱ {elapsed:.1f}s", style="dim"),
-                        _routines_panel(),
-                    ))
-                    await asyncio.sleep(0.05)
-
-            async def _confirm_with_live(
-                title: str, body_preview: str, tracker_name: str
-            ) -> bool:
-                nonlocal _live_stopped
-                if not _live_stopped:
-                    live.stop()
-                    _live_stopped = True
-                console.print(
-                    f"\n[cyan]\\[issue][/cyan] Ready to file on [bold]{tracker_name}[/bold]:"
-                )
-                console.print(f"  Title: {title}")
-                if body_preview:
-                    console.print(f"  Body: [dim]{body_preview[:300]}[/dim]")
-                ans = await asyncio.to_thread(
-                    lambda: Prompt.ask(
-                        "  File this issue?", choices=["y", "n"], default="n"
-                    )
-                )
-                return ans == "y"
-
-            tick_task = asyncio.create_task(_tick())
-            _confirm_token = set_issue_confirm_handler(_confirm_with_live)
-
-            try:
-                async for chunk in session.agent.stream(
-                    line, thread_id=session.thread_id, attachments=all_attachments or None
-                ):
-                    if not chunk:
-                        continue
-                    if first_token_time is None:
-                        first_token_time = time.perf_counter() - start_time
-                    response_text += chunk
-                    chunk_chars += len(chunk)
-                    if not _live_stopped:
-                        live.update(Group(
-                            _live_grid(Markdown(response_text), _routines_panel()),
-                            _status_line(),
-                        ))
-                    else:
-                        console.print(chunk, end="", highlight=False)
-            except Exception:
-                tick_task.cancel()
-                if not _live_stopped:
-                    live.stop()
-                raise
-            else:
-                tick_task.cancel()
-                session.last_ttft = first_token_time
-                stats_after = session.agent.token_stats
-                msg_tok = stats_after.get("completion", 0) - stats_before.get("completion", 0)
-                if not _live_stopped:
-                    if response_text:
-                        live.update(Group(
-                            _live_grid(Markdown(response_text), _routines_panel()),
-                            _status_line(exact_msg=msg_tok),
-                        ))
-                    live.stop()
-                else:
-                    console.print()
-                    console.print(_status_line(exact_msg=msg_tok))
-            finally:
-                reset_issue_confirm_handler(_confirm_token)
+        await run_tui(session)
     finally:
         await session.stop()
-        console.print("[dim]Goodbye.[/dim]")
 
 
 @app.command()
@@ -901,7 +627,7 @@ def repl(
     model: Annotated[str | None, typer.Option("--model", "-m")] = None,
     db: Annotated[str | None, typer.Option("--db")] = None,
 ) -> None:
-    """Start interactive REPL."""
+    """Start interactive REPL (Textual TUI)."""
     cfg = get_config()
     if base_url:
         cfg.base_url = base_url
@@ -912,7 +638,7 @@ def repl(
     if db:
         cfg.db_path = db
     set_config(cfg)
-    asyncio.run(_repl(cfg))
+    asyncio.run(_repl_tui(cfg))
 
 
 @app.command()
@@ -1668,6 +1394,24 @@ def skills_run(
             console.print(Markdown(response))
 
     asyncio.run(_go())
+
+
+@app.command()
+def web(
+    host: Annotated[str, typer.Option("--host", "-H", help="Bind host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", "-p", help="Bind port")] = 8000,
+) -> None:
+    """Start the web UI server (FastAPI + SvelteKit frontend)."""
+    import uvicorn
+    from lightclaw.web.server import create_app
+
+    cfg = get_config()
+    fastapi_app = create_app(cfg)
+    console.print(
+        f"[cyan]light-claw web[/cyan]  "
+        f"[dim]→[/dim]  [yellow]http://{host}:{port}[/yellow]"
+    )
+    uvicorn.run(fastapi_app, host=host, port=port)
 
 
 @app.callback(invoke_without_command=True)
