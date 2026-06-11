@@ -1,0 +1,16 @@
+[project]
+name = "lightclaw-opencode-mcp"
+version = "0.1.0"
+description = "MCP server that exposes opencode as tools, running in a Docker sandbox"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+lightclaw-opencode-mcp = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

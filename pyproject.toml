@@ -16,6 +16,11 @@ dependencies = [
     "discord-py>=2.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pyrefly>=0.1",
+]
+
 [project.scripts]
 lightclaw = "lightclaw.repl.cli:app"
 

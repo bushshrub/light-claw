@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+import mimetypes
+import os
+import re
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -20,6 +23,40 @@ from lightclaw.mcp import MCPManager
 from lightclaw.routines import RoutineEngine
 from lightclaw.scheduler import Scheduler
 from lightclaw.tools.registry import get_default_registry
+
+_EXT_MIME: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _parse_attachments(line: str) -> tuple[str, list[dict[str, Any]]]:
+    """Extract @/absolute/path tokens from line; return (cleaned_line, attachments)."""
+    attachments: list[dict[str, Any]] = []
+    tokens = re.findall(r"@(/\S+)", line)
+    for path in tokens:
+        if not os.path.isfile(path):
+            console.print(f"[yellow]Warning:[/yellow] not found: {path}")
+        else:
+            try:
+                ext = os.path.splitext(path)[1].lower()
+                mime = _EXT_MIME.get(ext) or (mimetypes.guess_type(path)[0] or "application/octet-stream")
+                with open(path, "rb") as f:
+                    data = f.read()
+                attachments.append({
+                    "type": "image" if ext in _EXT_MIME else "other",
+                    "data": data,
+                    "mime_type": mime,
+                    "filename": os.path.basename(path),
+                })
+            except OSError as exc:
+                console.print(f"[yellow]Warning:[/yellow] could not read {path}: {exc}")
+        line = line.replace(f"@{path}", "").strip()
+    return line, attachments
+
 
 app = typer.Typer(help="light-claw: local agent OS", no_args_is_help=False)
 mcp_app = typer.Typer(help="Manage MCP servers")
@@ -288,8 +325,13 @@ async def _repl(config: Config) -> None:
                 except KeyboardInterrupt:
                     break
                 continue
+            line, attachments = _parse_attachments(line)
+            if not line and not attachments:
+                continue
             with console.status("[dim]thinking...[/dim]"):
-                response = await session.agent.run(line, thread_id=session.thread_id)
+                response = await session.agent.run(
+                    line, thread_id=session.thread_id, attachments=attachments or None
+                )
             console.print(Markdown(response))
     finally:
         await session.stop()
@@ -373,6 +415,40 @@ def discord(
             try:
                 bot = DiscordBot(token, cfg, ws, registry)
                 console.print("[cyan]Discord bot starting...[/cyan]")
+                await bot.start()
+            finally:
+                await mcp.stop()
+
+    asyncio.run(_go())
+
+
+@app.command()
+def signal(
+    phone: Annotated[
+        str | None,
+        typer.Option("--phone", "-p", envvar="SIGNAL_PHONE_NUMBER", help="Registered Signal phone number"),
+    ] = None,
+    config_dir: Annotated[
+        str | None,
+        typer.Option("--config-dir", envvar="SIGNAL_CONFIG_DIR", help="signal-cli config directory"),
+    ] = None,
+) -> None:
+    """Start Signal bot (polls via signal-cli, responds to incoming messages)."""
+    if not phone:
+        console.print("[red]SIGNAL_PHONE_NUMBER required (--phone or env var)[/red]")
+        raise typer.Exit(1)
+
+    async def _go() -> None:
+        from lightclaw.channels.signal_bot import SignalBot
+
+        mcp = MCPManager()
+        registry = get_default_registry()
+        cfg = get_config()
+        async with Workspace(cfg) as ws:
+            await mcp.start(registry)
+            try:
+                bot = SignalBot(phone, config_dir, cfg, ws, registry)
+                console.print("[cyan]Signal bot starting...[/cyan]")
                 await bot.start()
             finally:
                 await mcp.stop()

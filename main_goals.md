@@ -22,6 +22,17 @@
 - **Signal** — message-based trigger (Signal CLI or signal-cli bridge)
 - Connectors are read/write: agent can send outbound messages, not just receive
 
+### 6. Read-Only Tool Default
+- Built-in tools are read-only unless explicitly opted in (memory search/get, note lookup, etc.)
+- Write/mutate tools (memory_set, shell, MCP write ops) require deliberate inclusion — not on by default
+- New tools default to read-only; writable tools must be marked as such at registration
+
+### 7. LLM Output is Untrusted
+- All LLM-generated content treated as untrusted input at system boundaries
+- Tool arguments from LLM are validated before execution — no blind pass-through
+- No LLM output ever interpolated into shell commands, SQL, or file paths without sanitization
+- Prompt injection via tool results or external data is a threat model concern, not an edge case
+
 ### 5. Agentic Coding via OpenCode (Docker-sandboxed)
 - `opencode` invoked as a tool, always inside a Docker sandbox — never on bare host
 - Sandbox is ephemeral: spun up per-task, torn down after
