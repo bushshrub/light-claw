@@ -1,0 +1,27 @@
+[project]
+name = "light-claw"
+version = "0.1.0"
+description = "Local agent OS — lightweight ironclaw in Python"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.0",
+    "aiosqlite>=0.20",
+    "rich>=13.0",
+    "typer>=0.12",
+    "apscheduler>=3.10",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "mcp>=1.0",
+    "discord-py>=2.0",
+]
+
+[project.scripts]
+lightclaw = "lightclaw.repl.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lightclaw"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
