@@ -7,19 +7,31 @@ Runs against any OpenAI-compatible endpoint (llama.cpp, OpenAI, etc.).
 
 ```
 lightclaw/
-├── config.py          Config dataclass, XDG path resolution, .env loading
-├── llm/client.py      Async OpenAI-compat wrapper (LLMClient)
+├── config.py              Config dataclass, XDG path resolution, .env loading
+├── log.py                 Structured logging
+├── llm/client.py          Async OpenAI-compat wrapper (LLMClient)
 ├── memory/
-│   └── workspace.py   SQLite + FTS5: conversation history + searchable notes
+│   └── workspace.py       SQLite + FTS5: conversation history + searchable notes
 ├── tools/
-│   ├── registry.py    Tool registry, @tool decorator, JSON schema auto-gen
-│   └── builtins.py    Built-in tools: memory_set/get/search, shell (gated)
-├── agent/loop.py      Agentic loop: LLM → tool calls → loop until done
-├── mcp/manager.py     MCP server manager: add/connect/teardown stdio servers
-├── scheduler/engine.py APScheduler cron + interval jobs
+│   ├── registry.py        Tool registry, @tool decorator, JSON schema auto-gen
+│   ├── builtins.py        Built-in tools: memory_set/get/search, safe_shell
+│   └── shell_guard.py     Docker sandbox guard for safe_shell
+├── agent/loop.py          Agentic loop: LLM → tool calls → loop until done
+├── mcp/manager.py         MCP server manager: add/connect/teardown stdio servers
+├── scheduler/engine.py    APScheduler cron + interval jobs
+├── routines/manager.py    Named routines (persistent scheduled tasks)
+├── jobs/manager.py        Job tracking
+├── issue_tracker/
+│   ├── base.py            IssueTracker ABC
+│   └── github.py          GitHub issue tracker implementation
 ├── channels/
-│   └── discord_bot.py Discord channel: DM + @mention → agent → reply
-└── repl/cli.py        Typer CLI + Rich REPL
+│   ├── discord_bot.py     Discord channel: DM + @mention → agent → reply
+│   └── signal_bot.py      Signal channel integration
+├── prompts/               System prompt files (system.md + channel-specific)
+└── repl/cli.py            Typer CLI + Rich REPL
+
+lightclaw-tools/
+└── opencode/              MCP server exposing opencode in a Docker sandbox
 ```
 
 ## Running
@@ -52,38 +64,23 @@ All config via `.env` (loaded automatically) or environment variables.
 | `LIGHTCLAW_MODEL` | `local-model` | Model name |
 | `LIGHTCLAW_DB` | `~/.config/lightclaw/workspace.db` | SQLite path |
 | `DISCORD_BOT_TOKEN` | — | Discord bot token |
+| `LIGHTCLAW_GITHUB_TOKEN` | — | GitHub token for issue tracker |
 | `XDG_CONFIG_HOME` | `~/.config` | Config/data root |
 
 MCP server configs live at `~/.config/lightclaw/mcp.json`.
 
 ## Safety
 
-### Shell tool
+### safe_shell (Docker sandbox)
 
-Works like Claude Code's permission system: approval-based with a persistent whitelist.
+`safe_shell` is the **only** code/command execution tool. There is no `shell` tool — it was removed after an agent escaped the host via `shell` for generated code execution.
 
-**Two-tier gate** (implemented in `lightclaw/tools/shell_guard.py`):
+`safe_shell` runs commands inside Docker (`python:3.12-slim` by default) with:
+- **Zero bind mounts** — no host filesystem access
+- **`--network none`** — no network access
+- Custom image selectable per call
 
-1. **Unconditional denylist** — `rm`, `sudo`, `dd`, `mkfs`, `kill`, `nc`, `chmod`, `crontab`, and others are hardcoded-blocked and cannot be whitelisted. Shell operators (`;`, `|`, `&`, `` ` ``), `$()`, `eval`, `exec`, and redirects to system paths are also unconditionally blocked.
-
-2. **User approval prompt** — all other commands require interactive approval before first run:
-   ```
-   [shell] Agent wants to run:
-     git status
-     [y] run once  [n] deny  [a] always allow  [b] always block
-   ```
-   - `y` — run once, ask again next time
-   - `a` — add to whitelist, run without prompting in future
-   - `b` — add to blocklist, permanently deny this command
-   - `n` / default — deny this call
-
-Whitelist and blocklist persist to `~/.config/lightclaw/shell_whitelist.json`. In non-interactive contexts (Discord, scheduler, piped input) the tool auto-denies — no silent shell access without a user present.
-
-Additional guards always active:
-- **`shell=False`** — `shlex.split()` + list args, prevents injection via unquoted arguments
-- **Protected path args** — arguments under `/etc`, `/sys`, `/dev`, `/proc` rejected
-- **Minimal subprocess env** — only `PATH` and `HOME` passed; `LD_PRELOAD` etc. stripped
-- **30s timeout**, **4 KiB output cap**
+Requires Docker installed and running. Returns error string if Docker not found.
 
 ### Agent loop
 
@@ -124,6 +121,6 @@ MCP tools appear prefixed `mcp__<server>__<tool>` in `/tools`.
 
 - **OpenAI-compat only** — single LLM interface works with llama.cpp, OpenAI, Anthropic (via proxy), or any compatible server
 - **SQLite not Postgres** — zero-config, file-based, portable; FTS5 for full-text search
-- **Shell tool off by default** — explicit opt-in required; safety guards active when on
+- **No host shell** — `shell` tool removed; `safe_shell` runs commands in Docker with zero bind mounts and no network
 - **MCP for extensibility** — prefer MCP tools over built-in shell for external integrations
 - **XDG config dir** — all state in `~/.config/lightclaw/`, no home dir clutter

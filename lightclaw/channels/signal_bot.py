@@ -135,7 +135,7 @@ class SignalBot:
         async def _signal_approver(command: str) -> str:
             if not is_interactive:
                 return "deny"
-            console.print(f"\n[yellow]\[shell] Agent wants to run:[/yellow]\n  [bold]{command}[/bold]\n  [y] run once  [n] deny")
+            console.print(f"\n[yellow]\\[shell] Agent wants to run:[/yellow]\n  [bold]{command}[/bold]\n  [y] run once  [n] deny")
             try:
                 ans = await asyncio.get_event_loop().run_in_executor(None, input, "> ")
                 return "run" if ans.strip().lower() == "y" else "deny"

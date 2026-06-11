@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import os
+import time
 import traceback
 
 import discord
+from discord import app_commands
 
 from lightclaw.console import console
 
 from lightclaw.agent import AgentLoop
-from lightclaw.config import Config, get_config
+from lightclaw.config import Config, config_dir, get_config
 from lightclaw.memory import Workspace
 from lightclaw.tools.registry import Registry, get_default_registry
 from lightclaw.tools.shell_guard import reset_approval_handler, set_approval_handler
@@ -68,6 +72,8 @@ class _ApprovalView(discord.ui.View):
 
 
 class DiscordBot:
+    SESSION_TTL = 600  # 10 minutes
+
     def __init__(
         self,
         token: str,
@@ -77,19 +83,79 @@ class DiscordBot:
     ) -> None:
         self._token = token
         cfg = config or get_config()
+        self._cfg = cfg
         self._agent = AgentLoop(cfg, registry or get_default_registry(), workspace)
+        self._sessions_path = os.path.join(config_dir(), "discord_sessions.json")
+        self._sessions: dict[str, float] = self._load_sessions()
 
         intents = discord.Intents.default()
         intents.message_content = True
         self._client = discord.Client(intents=intents)
         self._setup()
 
+    def _load_sessions(self) -> dict[str, float]:
+        try:
+            with open(self._sessions_path) as f:
+                raw: dict[str, float] = json.load(f)
+            now = time.time()
+            return {k: v for k, v in raw.items() if now - v < self.SESSION_TTL}
+        except Exception:
+            return {}
+
+    def _save_sessions(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._sessions_path), exist_ok=True)
+            now = time.time()
+            active = {k: v for k, v in self._sessions.items() if now - v < self.SESSION_TTL}
+            with open(self._sessions_path, "w") as f:
+                json.dump(active, f)
+        except Exception:
+            pass
+
     def _setup(self) -> None:
         client = self._client
         agent = self._agent
+        cfg = self._cfg
+        tree = app_commands.CommandTree(client)
+
+        def _session_lines() -> str:
+            stats = agent.token_stats
+            ctx = agent.context_length
+            lines = [
+                "**Session info**",
+                f"Prompt tokens: {stats['prompt']:,}",
+                f"Completion tokens: {stats['completion']:,}",
+                f"Total tokens: {stats['total']:,}",
+            ]
+            if ctx:
+                pct = stats["total"] / ctx * 100
+                lines.append(f"Context length: {ctx:,} ({pct:.1f}% used)")
+            return "\n".join(lines)
+
+        def _model_lines() -> str:
+            ctx = agent.context_length
+            lines = [f"**Model info**", f"Model: `{agent._llm.model}`"]
+            lines.append(f"Context length: {ctx:,} tokens" if ctx else "Context length: unknown")
+            return "\n".join(lines)
+
+        @tree.command(name="session", description="Show token usage for this session")
+        async def slash_session(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(_session_lines())
+
+        @tree.command(name="model", description="Show model name and context length")
+        async def slash_model(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(_model_lines())
 
         @client.event
         async def on_ready() -> None:
+            if cfg.discord_guild_id:
+                guild = discord.Object(id=cfg.discord_guild_id)
+                tree.copy_global_to(guild=guild)
+                await tree.sync(guild=guild)
+                console.print(f"[green][Discord][/green] slash commands synced to guild {cfg.discord_guild_id}")
+            else:
+                await tree.sync()
+                console.print("[green][Discord][/green] slash commands synced globally (may take up to 1h)")
             console.print(f"[green][Discord][/green] logged in as [cyan]{client.user}[/cyan] ({client.user.id})")
 
         @client.event
@@ -102,8 +168,29 @@ class DiscordBot:
 
             is_dm = isinstance(message.channel, discord.DMChannel)
             is_mention = client.user in message.mentions
-            if not (is_dm or is_mention):
+            session_key = f"{message.channel.id}:{message.author.id}"
+            now = time.time()
+
+            # Prune expired sessions lazily
+            if len(self._sessions) > 500:
+                cutoff = now - self.SESSION_TTL
+                self._sessions = {k: v for k, v in self._sessions.items() if v > cutoff}
+
+            has_active_session = (
+                session_key in self._sessions
+                and now - self._sessions[session_key] < self.SESSION_TTL
+            )
+
+            if not (is_dm or is_mention or has_active_session):
                 return
+
+            if has_active_session and not (is_dm or is_mention):
+                console.print(f"[dim][Discord] active session for {message.author} in channel {message.channel.id}[/dim]")
+
+            # Activate / refresh session on DM or mention
+            if is_dm or is_mention:
+                self._sessions[session_key] = now
+                self._save_sessions()
 
             content = message.content
             if is_mention:
@@ -167,6 +254,16 @@ class DiscordBot:
             channel = message.channel
             thread_id = f"discord_{message.author.id}"
 
+            parts = content.strip().split()
+            if len(parts) >= 2 and parts[0].lower() == f"!{cfg.discord_prefix}":
+                subcmd = parts[1].lower()
+                if subcmd == "session":
+                    await channel.send(_session_lines())
+                    return
+                if subcmd == "model":
+                    await channel.send(_model_lines())
+                    return
+
             # Fetch recent channel history so the agent can see prior messages.
             channel_context = ""
             try:
@@ -205,6 +302,8 @@ class DiscordBot:
                     )
                 for chunk in _split(response):
                     await channel.send(chunk)
+                self._sessions[session_key] = time.time()
+                self._save_sessions()
             except Exception as exc:
                 # Never silently drop — always reply with the error.
                 tb = traceback.format_exc()

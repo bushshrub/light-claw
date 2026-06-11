@@ -10,6 +10,13 @@ RUN npm install -g opencode-ai@latest
 
 RUN useradd -m -s /bin/bash sandbox
 
+# Writable config dir — entrypoint populates it from the host mount at runtime
+RUN mkdir -p /home/sandbox/.config/opencode \
+    && chown -R sandbox:sandbox /home/sandbox/.config
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 WORKDIR /workspace
 RUN chown sandbox:sandbox /workspace
 
@@ -21,4 +28,4 @@ ENV NODE_NO_WARNINGS=1
 LABEL org.opencontainers.image.title="lightclaw-opencode-sandbox"
 LABEL org.opencontainers.image.description="Sandboxed opencode coding agent with Python"
 
-ENTRYPOINT ["opencode"]
+ENTRYPOINT ["/entrypoint.sh"]

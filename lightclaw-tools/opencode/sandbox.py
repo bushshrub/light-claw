@@ -15,11 +15,37 @@ _DEFAULT_OPENCODE_CONFIG = os.environ.get(
 )
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-_JSONC_COMMENT = re.compile(r"//[^\n]*")
 
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    """Strip // line comments from JSONC without touching strings."""
+    out, i, n = [], 0, len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\":
+                i += 1
+                if i < n:
+                    out.append(text[i])
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _read_opencode_providers(config_dir: str) -> dict[str, dict]:
@@ -30,7 +56,7 @@ def _read_opencode_providers(config_dir: str) -> dict[str, dict]:
             continue
         try:
             with open(path) as f:
-                text = _JSONC_COMMENT.sub("", f.read())
+                text = _strip_jsonc_comments(f.read())
             return json.loads(text).get("provider", {})
         except Exception:
             pass
@@ -119,10 +145,12 @@ class Sandbox:
             "--security-opt", "no-new-privileges",
         ]
 
-        # Mount opencode config read-only if it exists
+        # Mount host opencode config read-only at a staging path.
+        # The entrypoint copies it to the writable config dir on each run,
+        # so API key changes are always picked up without rebuilding the image.
         config_dir = os.path.expanduser(self.opencode_config_dir)
         if os.path.isdir(config_dir):
-            cmd += ["-v", f"{config_dir}:/home/sandbox/.config/opencode:ro"]
+            cmd += ["-v", f"{config_dir}:/run/opencode-config-host:ro"]
         else:
             print(
                 f"[sandbox] WARNING: opencode config dir not found: {config_dir!r} — "
@@ -135,7 +163,7 @@ class Sandbox:
             if val := os.environ.get(env_key):
                 cmd += ["-e", f"{env_key}={val}"]
 
-        cmd += [self.image, "run", task, "--dangerously-skip-permissions"]
+        cmd += [self.image, "run", task, "--dangerously-skip-permissions", "--print-logs"]
         if effective_model:
             cmd += ["--model", effective_model]
 

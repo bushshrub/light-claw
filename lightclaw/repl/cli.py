@@ -9,7 +9,7 @@ import re
 from typing import Annotated, Any
 
 import typer
-from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -17,6 +17,8 @@ from rich.table import Table
 
 from lightclaw.agent import AgentLoop
 from lightclaw.config import Config, config_dir, get_config, set_config
+from lightclaw.console import console
+from lightclaw import log as _log  # noqa: F401  — installs RichHandler on import
 from lightclaw.jobs import JobManager
 from lightclaw.memory import Workspace
 from lightclaw.mcp import MCPManager
@@ -66,8 +68,6 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(routines_app, name="routines")
 
-console = Console()
-
 SLASH_HELP = """
 [bold]Slash commands[/bold]
   [cyan]/help[/cyan]                          show this help
@@ -75,6 +75,8 @@ SLASH_HELP = """
   [cyan]/memory search <q>[/cyan]             full-text search notes
   [cyan]/memory set <key> <value>[/cyan]      store a note
   [cyan]/memory del <key>[/cyan]              delete a note
+  [cyan]/session[/cyan]                       show session token usage
+  [cyan]/model[/cyan]                         show model name and context length
   [cyan]/tools[/cyan]                         list registered tools (incl. MCP)
   [cyan]/history[/cyan]                       show conversation history
   [cyan]/clear[/cyan]                         clear conversation history
@@ -135,6 +137,25 @@ class ReplSession:
 
         if cmd == "/help":
             console.print(SLASH_HELP)
+            return True
+
+        if cmd == "/session":
+            stats = self.agent.token_stats
+            ctx = self.agent.context_length
+            t = Table("Metric", "Value", title="Token Usage")
+            t.add_row("Prompt tokens", f"{stats['prompt']:,}")
+            t.add_row("Completion tokens", f"{stats['completion']:,}")
+            t.add_row("Total tokens", f"{stats['total']:,}")
+            if ctx:
+                t.add_row("Context length", f"{ctx:,}")
+                if stats["total"] > 0:
+                    t.add_row("Context used", f"{stats['total'] / ctx * 100:.1f}%")
+            console.print(t)
+            return True
+
+        if cmd == "/model":
+            ctx = self.agent.context_length
+            console.print(f"model=[yellow]{self.config.model}[/yellow]  context_length=[yellow]{ctx if ctx else 'unknown'}[/yellow]")
             return True
 
         if cmd == "/tools":
@@ -328,11 +349,47 @@ async def _repl(config: Config) -> None:
             line, attachments = _parse_attachments(line)
             if not line and not attachments:
                 continue
-            with console.status("[dim]thinking...[/dim]"):
-                response = await session.agent.run(
+
+            response_text = ""
+            live: Live | None = None
+            status = console.status("[dim]thinking...[/dim]")
+            status.start()
+            try:
+                async for chunk in session.agent.stream(
                     line, thread_id=session.thread_id, attachments=attachments or None
-                )
-            console.print(Markdown(response))
+                ):
+                    if not chunk:
+                        continue
+                    if live is None:
+                        status.stop()
+                        live = Live(
+                            Markdown(chunk),
+                            refresh_per_second=10,
+                            console=console,
+                        )
+                        live.start()
+                    response_text += chunk
+                    live.update(Markdown(response_text))
+            except Exception:
+                if live is None:
+                    status.stop()
+                else:
+                    live.stop()
+                raise
+            else:
+                if live is None:
+                    status.stop()
+                else:
+                    live.stop()
+
+            if response_text:
+                stats = session.agent.token_stats
+                ct = stats.get("completion", 0)
+                total = stats.get("total", 0)
+                if total > 0:
+                    console.print(
+                        f"[dim]↳ {ct:,} tok[/dim]"
+                    )
     finally:
         await session.stop()
         console.print("[dim]Goodbye.[/dim]")

@@ -98,7 +98,7 @@ async def opencode_run_local(task: str, cwd: str | None = None, model: str | Non
         cmd += ["--dir", cwd]
     if effective_model:
         cmd += ["--model", effective_model]
-    cmd += ["--dangerously-skip-permissions"]
+    cmd += ["--dangerously-skip-permissions", "--print-logs"]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,

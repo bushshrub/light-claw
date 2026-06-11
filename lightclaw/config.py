@@ -10,6 +10,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+from pathlib import Path
+
+def _load_system_prompt() -> str:
+    prompt_file = Path(__file__).parent / "prompts" / "system.md"
+    try:
+        return prompt_file.read_text().strip()
+    except Exception:
+        return "You are light-claw, a local AI assistant. Be concise and helpful."
+
+
 def config_dir() -> str:
     """XDG_CONFIG_HOME/lightclaw, or ~/.config/lightclaw on macOS/Linux."""
     xdg = os.environ.get("XDG_CONFIG_HOME")
@@ -42,13 +52,18 @@ class Config:
     issue_repo: str = field(
         default_factory=lambda: os.environ.get("LIGHTCLAW_ISSUE_REPO", "bushshrub/light-claw")
     )
-    system_prompt: str = (
-        "You are light-claw, a local AI assistant. "
-        "You have access to tools and persistent memory. "
-        "Be concise and helpful."
-    )
+    system_prompt: str = field(default_factory=_load_system_prompt)
     max_tool_rounds: int = 10
     multimodal: bool = True
+    context_length: int | None = field(
+        default_factory=lambda: int(v) if (v := os.environ.get("LIGHTCLAW_CONTEXT_LENGTH")) else None
+    )
+    discord_guild_id: int | None = field(
+        default_factory=lambda: int(v) if (v := os.environ.get("DISCORD_GUILD_ID")) else None
+    )
+    discord_prefix: str = field(
+        default_factory=lambda: os.environ.get("DISCORD_PREFIX", "lc")
+    )
 
 
 _default: Config | None = None

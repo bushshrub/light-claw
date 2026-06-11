@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
-import shlex
-import subprocess
 import sys
 import traceback
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 
+from lightclaw.console import console
 from lightclaw.tools.registry import get_default_registry
-from lightclaw.tools.shell_guard import check_async
 
 _reg = get_default_registry()
 
@@ -39,9 +37,9 @@ async def _default_confirm(title: str, body_preview: str, tracker_name: str) -> 
     """Stdin-based confirmation for interactive contexts."""
     if not sys.stdin.isatty():
         return False
-    print(f"\n[issue] Ready to file on {tracker_name}:")
-    print(f"  Title: {title}")
-    print(f"  Body preview: {body_preview[:300]}...")
+    console.print(f"\n[cyan]\\[issue][/cyan] Ready to file on [bold]{tracker_name}[/bold]:")
+    console.print(f"  Title: {title}")
+    console.print(f"  Body preview: [dim]{body_preview[:300]}...[/dim]")
     ans = input("  File this issue? [y/N] ").strip().lower()
     return ans == "y"
 
@@ -69,37 +67,109 @@ async def memory_search(query: str) -> list[dict]:
         return await ws.search(query)
 
 
+
 @_reg.tool(
     description=(
-        "Run a shell command and return stdout+stderr. "
-        "Dangerous commands (rm, sudo, dd, etc.) blocked unconditionally. "
-        "All other commands require user approval or a prior whitelist entry."
+        "Fetch the text content of a web page or URL. "
+        "Returns the page's plain-text content (HTML tags stripped). "
+        "Use for looking up documentation, news, or any public URL. "
+        "Respects a 30s timeout. Output capped at 8 000 characters."
     )
 )
-async def shell(command: str) -> str:
-    verdict, reason = await check_async(command)
-    if verdict == "deny":
-        return reason or "[DENIED]"
-
-    tokens = shlex.split(command)
+async def web_fetch(url: str) -> str:
     try:
-        result = subprocess.run(
-            tokens,
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env={
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "HOME": str(Path.home()),
-            },
-        )
-    except FileNotFoundError:
-        return f"Command not found: {tokens[0]!r}"
-    except subprocess.TimeoutExpired:
-        return "Command timed out after 30s"
+        import httpx
+    except ImportError:
+        return "httpx not installed — run: uv add httpx"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "lightclaw/0.1 (+https://github.com/bushshrub/light-claw)"},
+            )
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}"
+    except Exception as exc:
+        return f"Fetch error: {exc}"
 
-    output = result.stdout + result.stderr
+    content_type = resp.headers.get("content-type", "")
+    text = resp.text
+
+    if "html" in content_type:
+        # Strip tags with stdlib html.parser
+        from html.parser import HTMLParser
+
+        class _Stripper(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self._chunks: list[str] = []
+                self._skip = False
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                if tag in ("script", "style", "head"):
+                    self._skip = True
+
+            def handle_endtag(self, tag: str) -> None:
+                if tag in ("script", "style", "head"):
+                    self._skip = False
+
+            def handle_data(self, data: str) -> None:
+                if not self._skip:
+                    stripped = data.strip()
+                    if stripped:
+                        self._chunks.append(stripped)
+
+        stripper = _Stripper()
+        stripper.feed(text)
+        text = "\n".join(stripper._chunks)
+
+    # Collapse blank lines and cap
+    import re
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:8000]
+
+
+@_reg.tool(
+    description=(
+        "Run a shell command inside a fully-isolated Docker sandbox. "
+        "Zero bind mounts (no host filesystem access), no network, 256 MiB RAM, 0.5 CPU. "
+        "Safe for agent-generated or untrusted code. "
+        "Requires Docker daemon running locally. "
+        "Example: safe_shell('python3 -c \"print(fib(10))\"'). "
+        "Use this instead of shell() for any code execution task."
+    )
+)
+async def safe_shell(command: str, image: str = "python:3.12-slim") -> str:
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--memory", "256m",
+        "--cpus", "0.5",
+        "--read-only",
+        "--tmpfs", "/tmp",
+        "--tmpfs", "/root",
+        image,
+        "sh", "-c", command,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *docker_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return "Sandbox timed out after 30s"
+    except FileNotFoundError:
+        return "Docker not found — install Docker to use safe_shell"
+    except Exception as exc:
+        return f"Sandbox error: {exc}"
+
+    output = (stdout + stderr).decode(errors="replace")
     return output[:4096]
 
 

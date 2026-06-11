@@ -9,6 +9,7 @@ from typing import Any
 
 from lightclaw.config import Config, get_config
 from lightclaw.llm import LLMClient
+from lightclaw import log
 from lightclaw.memory import Workspace
 from lightclaw.tools.registry import Registry, get_default_registry
 
@@ -24,6 +25,16 @@ class AgentLoop:
         self._llm = LLMClient(self._cfg)
         self._registry = registry or get_default_registry()
         self._workspace = workspace
+        self._tokens = {"prompt": 0, "completion": 0, "total": 0}
+        self._context_length: int | None = self._cfg.context_length
+
+    @property
+    def token_stats(self) -> dict[str, int]:
+        return dict(self._tokens)
+
+    @property
+    def context_length(self) -> int | None:
+        return self._context_length
 
     # Each attachment dict has keys: type ("image"|"audio"|"video"|"other"),
     # data (bytes), mime_type (str), filename (str).
@@ -100,7 +111,6 @@ class AgentLoop:
         attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text chunks as agent reasons and executes tools."""
-        # Build context
         history = []
         if self._workspace:
             history = await self._workspace.get_history(thread_id)
@@ -119,27 +129,89 @@ class AgentLoop:
         tools = self._registry.schemas()
         rounds = 0
 
+        if self._context_length is None:
+            self._context_length = await self._llm.fetch_context_length()
+
         while rounds < self._cfg.max_tool_rounds:
             rounds += 1
-            resp = await self._llm.chat(messages, tools=tools or None)
-            msg = resp.choices[0].message
 
-            # No tool calls → final answer
-            if not msg.tool_calls:
-                content = msg.content or ""
+            if log._enabled(log.DEBUG):
+                for m in messages:
+                    role = m.get("role", "?")
+                    content = m.get("content") or ""
+                    preview = (content[:120] + "…") if len(content) > 120 else content
+                    log.debug(f"[{role}] {preview!r}")
+
+            text_parts: list[str] = []
+            tool_call_acc: dict[int, dict[str, Any]] = {}
+
+            resp = await self._llm.chat_stream(messages, tools=tools or None)
+            async for chunk in resp:
+                # Usage arrives in the final chunk (stream_options.include_usage)
+                if chunk.usage:
+                    self._tokens["prompt"] += chunk.usage.prompt_tokens or 0
+                    self._tokens["completion"] += chunk.usage.completion_tokens or 0
+                    self._tokens["total"] += chunk.usage.total_tokens or 0
+
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+
+                if delta.content:
+                    text_parts.append(delta.content)
+                    yield delta.content
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_call_acc:
+                            fn = tc_delta.function
+                            tool_call_acc[idx] = {
+                                "id": tc_delta.id or "",
+                                "type": "function",
+                                "function": {
+                                    "name": fn.name or "" if fn else "",
+                                    "arguments": fn.arguments or "" if fn else "",
+                                },
+                            }
+                        else:
+                            if tc_delta.id:
+                                tool_call_acc[idx]["id"] = tc_delta.id
+                            fn = tc_delta.function
+                            if fn:
+                                if fn.name:
+                                    tool_call_acc[idx]["function"]["name"] += fn.name
+                                if fn.arguments:
+                                    tool_call_acc[idx]["function"]["arguments"] += fn.arguments
+
+            full_text = "".join(text_parts)
+
+            if log._enabled(log.DEBUG):
+                if tool_call_acc:
+                    for tc in sorted(tool_call_acc.values(), key=lambda t: t["id"]):
+                        log.debug(f"← tool_call {tc['function']['name']}({tc['function']['arguments']})")
+                else:
+                    log.debug(f"← assistant {full_text[:120]!r}")
+
+            # No tool calls → final answer (chunks already yielded)
+            if not tool_call_acc:
                 if self._workspace:
-                    await self._workspace.add_message("assistant", content, thread_id)
-                yield content
+                    await self._workspace.add_message("assistant", full_text, thread_id)
                 return
 
-            # Append assistant message with tool calls
-            messages.append(msg.model_dump(exclude_unset=False))
+            # Tool calls → append assistant message and execute
+            tool_calls_list = [tool_call_acc[i] for i in sorted(tool_call_acc)]
+            messages.append({
+                "role": "assistant",
+                "content": full_text or None,
+                "tool_calls": tool_calls_list,
+            })
 
-            # Execute each tool call
-            tool_results: list[str] = []
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                args = tc.function.arguments
+            for tc in tool_calls_list:
+                name = tc["function"]["name"]
+                args = tc["function"]["arguments"]
+                log.info(f"tool {name}  args={args}")
                 try:
                     result = await self._registry.call(name, args)
                     result_str = (
@@ -147,14 +219,12 @@ class AgentLoop:
                     )
                 except Exception as exc:
                     result_str = f"Error: {exc}"
-                tool_results.append(result_str)
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tc.id,
+                    "tool_call_id": tc["id"],
                     "content": result_str,
                 })
 
-        # Fallback if max rounds hit
         fallback = "[max tool rounds reached]"
         if self._workspace:
             await self._workspace.add_message("assistant", fallback, thread_id)

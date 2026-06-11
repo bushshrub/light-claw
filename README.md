@@ -3,6 +3,9 @@
 > [!WARNING]
 > This ENTIRE project is vibe coded (except for this sentence).
 > Do not use it.
+>
+> Also, this is distributed as SOURCE ONLY. There are no binaries.
+> You need to tune it for yourself. If unsure, just ask an LLM.
 
 Local agent OS — Python reimplementation of [ironclaw](https://github.com/nearai/ironclaw) core concepts. Runs an agentic loop against any OpenAI-compatible endpoint: llama.cpp, OpenAI, Anthropic (via proxy), or any compatible server.
 

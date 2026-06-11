@@ -155,9 +155,9 @@ def reset_approval_handler(token: contextvars.Token) -> None:
 
 def _sync_prompt(command: str) -> str:
     """Blocking stdin prompt for REPL context."""
-    print(f"\n\033[33m[shell] Agent wants to run:\033[0m")
-    print(f"  \033[1m{command}\033[0m")
-    print("  [y] run once  [n] deny  [a] always allow  [b] always block  (default: n)")
+    console.print(f"\n[yellow]\\[shell] Agent wants to run:[/yellow]")
+    console.print(f"  [bold]{command}[/bold]")
+    console.print("  [y] run once  [n] deny  [a] always allow  [b] always block  (default: n)")
     try:
         choice = input("  > ").strip().lower()
     except (EOFError, KeyboardInterrupt):
