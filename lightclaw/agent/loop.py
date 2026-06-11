@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import AsyncIterator
@@ -200,7 +201,7 @@ class AgentLoop:
                     await self._workspace.add_message("assistant", full_text, thread_id)
                 return
 
-            # Tool calls → append assistant message and execute
+            # Tool calls → append assistant message and execute (in parallel)
             tool_calls_list = [tool_call_acc[i] for i in sorted(tool_call_acc)]
             messages.append({
                 "role": "assistant",
@@ -208,7 +209,7 @@ class AgentLoop:
                 "tool_calls": tool_calls_list,
             })
 
-            for tc in tool_calls_list:
+            async def _call_tool(tc: dict[str, Any]) -> tuple[str, str]:
                 name = tc["function"]["name"]
                 args = tc["function"]["arguments"]
                 log.info(f"tool {name}  args={args}")
@@ -219,9 +220,13 @@ class AgentLoop:
                     )
                 except Exception as exc:
                     result_str = f"Error: {exc}"
+                return tc["id"], result_str
+
+            tool_results = await asyncio.gather(*[_call_tool(tc) for tc in tool_calls_list])
+            for tool_id, result_str in tool_results:
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tc["id"],
+                    "tool_call_id": tool_id,
                     "content": result_str,
                 })
 

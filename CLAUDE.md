@@ -9,14 +9,15 @@ Runs against any OpenAI-compatible endpoint (llama.cpp, OpenAI, etc.).
 lightclaw/
 ├── config.py              Config dataclass, XDG path resolution, .env loading
 ├── log.py                 Structured logging
-├── llm/client.py          Async OpenAI-compat wrapper (LLMClient)
+├── llm/client.py          Async OpenAI-compat wrapper (LLMClient) — chat() + chat_stream()
 ├── memory/
 │   └── workspace.py       SQLite + FTS5: conversation history + searchable notes
 ├── tools/
 │   ├── registry.py        Tool registry, @tool decorator, JSON schema auto-gen
-│   ├── builtins.py        Built-in tools: memory_set/get/search, safe_shell
+│   ├── builtins.py        Built-in tools: memory_set/get/search, safe_shell, issue reporting
+│   ├── subagent.py        Subagent tools: subagent_run, subagent_team (parallel agents)
 │   └── shell_guard.py     Docker sandbox guard for safe_shell
-├── agent/loop.py          Agentic loop: LLM → tool calls → loop until done
+├── agent/loop.py          Agentic loop: streaming LLM → parallel tool calls → loop
 ├── mcp/manager.py         MCP server manager: add/connect/teardown stdio servers
 ├── scheduler/engine.py    APScheduler cron + interval jobs
 ├── routines/manager.py    Named routines (persistent scheduled tasks)
@@ -28,7 +29,7 @@ lightclaw/
 │   ├── discord_bot.py     Discord channel: DM + @mention → agent → reply
 │   └── signal_bot.py      Signal channel integration
 ├── prompts/               System prompt files (system.md + channel-specific)
-└── repl/cli.py            Typer CLI + Rich REPL
+└── repl/cli.py            Typer CLI + Rich REPL (streaming Markdown, token counter)
 
 lightclaw-tools/
 └── opencode/              MCP server exposing opencode in a Docker sandbox
@@ -124,3 +125,6 @@ MCP tools appear prefixed `mcp__<server>__<tool>` in `/tools`.
 - **No host shell** — `shell` tool removed; `safe_shell` runs commands in Docker with zero bind mounts and no network
 - **MCP for extensibility** — prefer MCP tools over built-in shell for external integrations
 - **XDG config dir** — all state in `~/.config/lightclaw/`, no home dir clutter
+- **Streaming LLM** — `chat_stream()` with `stream_options.include_usage`; REPL shows live Markdown + token counter (`↳ N tok`)
+- **Parallel tool execution** — all tool calls in a single LLM round run via `asyncio.gather`, enabling true concurrency
+- **Subagents** — `subagent_run(prompt, label)` / `subagent_team(tasks)` spawn parallel `AgentLoop` instances sharing the same tool registry; subagents can recurse
