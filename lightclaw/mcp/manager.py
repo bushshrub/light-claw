@@ -8,6 +8,7 @@ import os
 from typing import Any
 
 from lightclaw.config import config_dir
+from lightclaw.console import console
 from lightclaw.tools.registry import Registry
 
 
@@ -57,7 +58,7 @@ class MCPManager:
             try:
                 await self._connect(name, cfg, registry)
             except Exception as exc:
-                print(f"[MCP] {name}: failed to connect — {exc}")
+                console.print(f"[red][MCP] {name}: failed to connect —[/red] {exc}")
 
     async def stop(self) -> None:
         await self._exit_stack.aclose()
@@ -104,7 +105,7 @@ class MCPManager:
             }
             registry.register_raw(tool_name, spec, _call)
 
-        print(
-            f"[MCP] {name}: connected, "
-            f"{len(result.tools)} tool(s) registered"
+        console.print(
+            f"[green][MCP] {name}:[/green] connected, "
+            f"[cyan]{len(result.tools)}[/cyan] tool(s) registered"
         )

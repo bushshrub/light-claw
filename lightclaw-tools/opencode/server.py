@@ -12,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
 
-from sandbox import Sandbox  # noqa: E402
+from sandbox import Sandbox, list_models  # noqa: E402
 
 _sandbox = Sandbox()
 
@@ -34,6 +34,28 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+async def opencode_list_models() -> str:
+    """List available models from the opencode provider config.
+
+    Returns provider/model strings that can be passed to the model parameter
+    of opencode_run or opencode_run_local. Also shows the current default.
+    Use openrouter/* models when OPENROUTER_API_KEY is set.
+    """
+    models = list_models(_sandbox.opencode_config_dir)
+    default = _sandbox.default_model or "(opencode default)"
+    lines = [f"Default model: {default}", "", "Configured models:"]
+    lines += [f"  {m}" for m in models] if models else ["  (none found in config)"]
+    lines += [
+        "",
+        "OpenRouter models (if OPENROUTER_API_KEY is set): openrouter/<model>",
+        "  e.g. openrouter/anthropic/claude-sonnet-4-5",
+        "       openrouter/google/gemini-2.5-pro",
+        "       openrouter/openai/gpt-4o",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def opencode_run(
     task: str,
     workspace: str,
@@ -43,11 +65,14 @@ async def opencode_run(
 
     The workspace directory is mounted read-write into the container.
     opencode will read and modify files within it.
+    Use opencode_list_models to see available models.
 
     Args:
         task: The coding task or instruction for opencode.
         workspace: Absolute path to the project directory on the host.
-        model: Model override in provider/model format (e.g. 'llama-local/gemma4-12b').
+        model: Model in provider/model format. Defaults to the model lightclaw
+            is configured to use. Examples: 'llama-local/gemma4-12b',
+            'openrouter/anthropic/claude-sonnet-4-5'.
     """
     try:
         return await _sandbox.run_task(task, workspace, model=model)
@@ -67,11 +92,12 @@ async def opencode_run_local(task: str, cwd: str | None = None, model: str | Non
         cwd: Working directory (defaults to current directory).
         model: Model override in provider/model format (e.g. 'openai/gpt-4o').
     """
+    effective_model = model or _sandbox.default_model
     cmd = ["opencode", "run", task]
     if cwd:
         cmd += ["--dir", cwd]
-    if model:
-        cmd += ["--model", model]
+    if effective_model:
+        cmd += ["--model", effective_model]
     cmd += ["--dangerously-skip-permissions"]
 
     proc = await asyncio.create_subprocess_exec(

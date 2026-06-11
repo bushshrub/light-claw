@@ -23,6 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from lightclaw.config import config_dir
+from lightclaw.console import console
 
 if TYPE_CHECKING:
     from lightclaw.jobs import Job, JobManager
@@ -222,8 +223,8 @@ class RoutineEngine:
         if len(attempts) > _HEAL_MAX_PER_HOUR:
             # Too many failures — disable and log
             self.set_enabled(routine_id, False)
-            print(
-                f"[routines] {routine_id}: disabled after "
+            console.print(
+                f"[red][routines] {routine_id}:[/red] disabled after "
                 f"{_HEAL_MAX_PER_HOUR} failed heal attempts in 1 hour"
             )
             return
@@ -251,7 +252,7 @@ class RoutineEngine:
             job_id=f"heal_{routine_id}_{int(now)}",
             thread_id=f"heal_{routine.thread_id}",
         )
-        print(
-            f"[routines] {routine_id}: heal job submitted "
-            f"(attempt {len(attempts)}/{_HEAL_MAX_PER_HOUR})"
+        console.print(
+            f"[yellow][routines] {routine_id}:[/yellow] heal job submitted "
+            f"(attempt [cyan]{len(attempts)}/{_HEAL_MAX_PER_HOUR}[/cyan])"
         )

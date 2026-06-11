@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from lightclaw.config import config_dir
+from lightclaw.console import console
 
 # ---------------------------------------------------------------------------
 # Unconditional denylist — cannot be whitelisted, ever.

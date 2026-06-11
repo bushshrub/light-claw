@@ -15,6 +15,7 @@ from typing import Any
 
 from lightclaw.agent import AgentLoop
 from lightclaw.config import Config, get_config
+from lightclaw.console import console
 from lightclaw.memory import Workspace
 from lightclaw.tools.registry import Registry, get_default_registry
 from lightclaw.tools.shell_guard import reset_approval_handler, set_approval_handler
@@ -134,7 +135,7 @@ class SignalBot:
         async def _signal_approver(command: str) -> str:
             if not is_interactive:
                 return "deny"
-            print(f"\n[shell] Agent wants to run:\n  {command}\n  [y] run once  [n] deny")
+            console.print(f"\n[yellow]\[shell] Agent wants to run:[/yellow]\n  [bold]{command}[/bold]\n  [y] run once  [n] deny")
             try:
                 ans = await asyncio.get_event_loop().run_in_executor(None, input, "> ")
                 return "run" if ans.strip().lower() == "y" else "deny"
@@ -152,7 +153,7 @@ class SignalBot:
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            print(f"[Signal] error handling message from {sender}: {exc}\n{tb}")
+            console.print(f"[red][Signal] error handling message from {sender}:[/red] {exc}\n{tb}")
             try:
                 await self._send(sender, f"Error: {exc}")
             except Exception:
@@ -162,15 +163,15 @@ class SignalBot:
 
     async def start(self) -> None:
         self._running = True
-        print(f"[Signal] listening on {self._phone}  (config: {self._config_dir})")
-        print("[Signal] requires signal-cli — https://github.com/AsamK/signal-cli")
+        console.print(f"[green][Signal][/green] listening on [cyan]{self._phone}[/cyan]  (config: {self._config_dir})")
+        console.print("[dim][Signal] requires signal-cli — https://github.com/AsamK/signal-cli[/dim]")
         while self._running:
             try:
                 envelopes = await self._receive()
                 for envelope in envelopes:
                     asyncio.create_task(self._handle_envelope(envelope))
             except Exception as exc:
-                print(f"[Signal] receive error: {exc}")
+                console.print(f"[red][Signal] receive error:[/red] {exc}")
                 await asyncio.sleep(5)
 
     async def close(self) -> None:

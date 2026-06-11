@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -14,10 +15,58 @@ _DEFAULT_OPENCODE_CONFIG = os.environ.get(
 )
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_JSONC_COMMENT = re.compile(r"//[^\n]*")
 
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
+
+
+def _read_opencode_providers(config_dir: str) -> dict[str, dict]:
+    """Return {provider_id: provider_cfg} from the opencode config, or {}."""
+    for filename in ("opencode.jsonc", "opencode.json", "config.json"):
+        path = os.path.join(os.path.expanduser(config_dir), filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                text = _JSONC_COMMENT.sub("", f.read())
+            return json.loads(text).get("provider", {})
+        except Exception:
+            pass
+    return {}
+
+
+def derive_default_model(config_dir: str = _DEFAULT_OPENCODE_CONFIG) -> str | None:
+    """Derive opencode's default model from lightclaw's LLM env vars.
+
+    Matches LIGHTCLAW_BASE_URL against configured opencode provider baseURLs,
+    then returns '{provider_id}/{LIGHTCLAW_MODEL}'. Falls back to
+    OPENCODE_DEFAULT_MODEL if set, or None.
+    """
+    if explicit := os.environ.get("OPENCODE_DEFAULT_MODEL"):
+        return explicit
+
+    base_url = os.environ.get("LIGHTCLAW_BASE_URL", "").rstrip("/")
+    model = os.environ.get("LIGHTCLAW_MODEL", "")
+    if not base_url or not model:
+        return None
+
+    for provider_id, cfg in _read_opencode_providers(config_dir).items():
+        provider_url = cfg.get("options", {}).get("baseURL", "").rstrip("/")
+        if provider_url and provider_url == base_url:
+            return f"{provider_id}/{model}"
+
+    return None
+
+
+def list_models(config_dir: str = _DEFAULT_OPENCODE_CONFIG) -> list[str]:
+    """Return all provider/model strings from the opencode config."""
+    models = []
+    for provider_id, cfg in _read_opencode_providers(config_dir).items():
+        for model_id in cfg.get("models", {}):
+            models.append(f"{provider_id}/{model_id}")
+    return models
 
 
 class Sandbox:
@@ -28,6 +77,7 @@ class Sandbox:
     ) -> None:
         self.image = image
         self.opencode_config_dir = opencode_config_dir
+        self.default_model = derive_default_model(opencode_config_dir)
 
     async def build_image(self, dockerfile_dir: str | None = None) -> None:
         """Build the sandbox Docker image from Dockerfile.sandbox."""
@@ -57,6 +107,8 @@ class Sandbox:
         if not os.path.isdir(workspace):
             raise ValueError(f"workspace directory does not exist: {workspace!r}")
 
+        effective_model = model or self.default_model
+
         cmd = [
             "docker", "run", "--rm",
             "-v", f"{workspace}:/workspace",
@@ -78,9 +130,14 @@ class Sandbox:
                 file=sys.stderr,
             )
 
+        # Forward provider API keys from host environment
+        for env_key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            if val := os.environ.get(env_key):
+                cmd += ["-e", f"{env_key}={val}"]
+
         cmd += [self.image, "run", task, "--dangerously-skip-permissions"]
-        if model:
-            cmd += ["--model", model]
+        if effective_model:
+            cmd += ["--model", effective_model]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

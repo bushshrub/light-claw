@@ -6,6 +6,8 @@ import traceback
 
 import discord
 
+from lightclaw.console import console
+
 from lightclaw.agent import AgentLoop
 from lightclaw.config import Config, get_config
 from lightclaw.memory import Workspace
@@ -88,7 +90,7 @@ class DiscordBot:
 
         @client.event
         async def on_ready() -> None:
-            print(f"[Discord] logged in as {client.user} ({client.user.id})")
+            console.print(f"[green][Discord][/green] logged in as [cyan]{client.user}[/cyan] ({client.user.id})")
 
         @client.event
         async def on_message(message: discord.Message) -> None:
@@ -206,7 +208,7 @@ class DiscordBot:
             except Exception as exc:
                 # Never silently drop — always reply with the error.
                 tb = traceback.format_exc()
-                print(f"[Discord] error handling message from {message.author}: {exc}\n{tb}")
+                console.print(f"[red][Discord] error handling message from {message.author}:[/red] {exc}\n{tb}")
                 try:
                     await channel.send(f"⚠️ Error: {exc}")
                 except Exception:
