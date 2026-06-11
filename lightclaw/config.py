@@ -36,6 +36,12 @@ class Config:
             os.path.join(config_dir(), "workspace.db"),
         )
     )
+    github_token: str = field(
+        default_factory=lambda: os.environ.get("LIGHTCLAW_GITHUB_TOKEN", "")
+    )
+    issue_repo: str = field(
+        default_factory=lambda: os.environ.get("LIGHTCLAW_ISSUE_REPO", "bushshrub/light-claw")
+    )
     system_prompt: str = (
         "You are light-claw, a local AI assistant. "
         "You have access to tools and persistent memory. "

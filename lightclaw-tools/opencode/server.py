@@ -34,7 +34,11 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def opencode_run(task: str, workspace: str) -> str:
+async def opencode_run(
+    task: str,
+    workspace: str,
+    model: str | None = None,
+) -> str:
     """Run a coding task using opencode inside a Docker sandbox.
 
     The workspace directory is mounted read-write into the container.
@@ -43,9 +47,10 @@ async def opencode_run(task: str, workspace: str) -> str:
     Args:
         task: The coding task or instruction for opencode.
         workspace: Absolute path to the project directory on the host.
+        model: Model override in provider/model format (e.g. 'llama-local/gemma4-12b').
     """
     try:
-        return await _sandbox.run_task(task, workspace)
+        return await _sandbox.run_task(task, workspace, model=model)
     except Exception as exc:
         return f"Error: {exc}"
 

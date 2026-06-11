@@ -8,6 +8,10 @@ import re
 import sys
 
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "lightclaw-opencode-sandbox:latest")
+_DEFAULT_OPENCODE_CONFIG = os.environ.get(
+    "OPENCODE_CONFIG_DIR",
+    os.path.expanduser("~/.config/opencode"),
+)
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -17,8 +21,13 @@ def _strip_ansi(text: str) -> str:
 
 
 class Sandbox:
-    def __init__(self, image: str = SANDBOX_IMAGE) -> None:
+    def __init__(
+        self,
+        image: str = SANDBOX_IMAGE,
+        opencode_config_dir: str = _DEFAULT_OPENCODE_CONFIG,
+    ) -> None:
         self.image = image
+        self.opencode_config_dir = opencode_config_dir
 
     async def build_image(self, dockerfile_dir: str | None = None) -> None:
         """Build the sandbox Docker image from Dockerfile.sandbox."""
@@ -52,12 +61,24 @@ class Sandbox:
             "docker", "run", "--rm",
             "-v", f"{workspace}:/workspace",
             "--workdir", "/workspace",
+            "-e", "HOME=/home/sandbox",
             "--memory", "2g",
             "--cpus", "1.5",
             "--security-opt", "no-new-privileges",
-            self.image,
-            "run", task,
         ]
+
+        # Mount opencode config read-only if it exists
+        config_dir = os.path.expanduser(self.opencode_config_dir)
+        if os.path.isdir(config_dir):
+            cmd += ["-v", f"{config_dir}:/home/sandbox/.config/opencode:ro"]
+        else:
+            print(
+                f"[sandbox] WARNING: opencode config dir not found: {config_dir!r} — "
+                "container will run without provider configuration",
+                file=sys.stderr,
+            )
+
+        cmd += [self.image, "run", task, "--dangerously-skip-permissions"]
         if model:
             cmd += ["--model", model]
 
