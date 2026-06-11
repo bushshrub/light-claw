@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +238,40 @@ def create_app(
             "mime_type": mime,
             "data": b64,
             "size": len(data),
+        }
+
+    @app.post("/api/v1/audio/upload")
+    async def upload_audio(file: UploadFile = File(...)):
+        data = await file.read()
+        mime = file.content_type or "application/octet-stream"
+        
+        # Validate audio file types
+        audio_mimes = {"audio/wav", "audio/webm", "audio/mp3", "audio/mpeg", "audio/x-m4a", "audio/flac"}
+        if mime not in audio_mimes:
+            raise HTTPException(status_code=400, detail=f"Unsupported audio format: {mime}")
+        
+        # Generate unique filename
+        file_ext = mime.split("/")[-1]
+        if file_ext == "mpeg":
+            file_ext = "mp3"
+        unique_id = str(uuid.uuid4())
+        filename = f"{unique_id}.{file_ext}"
+        
+        # Save to temporary directory
+        temp_dir = Path("/tmp/lightclaw_audio")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = temp_dir / filename
+        
+        with open(file_path, "wb") as f:
+            f.write(data)
+        
+        return {
+            "filename": filename,
+            "original_filename": file.filename,
+            "mime_type": mime,
+            "size": len(data),
+            "file_path": str(file_path),
+            "id": unique_id,
         }
 
     # Frontend static files — must be registered last

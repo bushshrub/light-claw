@@ -4,17 +4,8 @@
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import type { Message, Attachment, TokenStats, Tool, MemoryNote, ReadonlyStatus } from '$lib/api';
-	import {
-		streamChat,
-		fetchModel,
-		fetchHistory,
-		clearHistory,
-		fetchTools,
-		fetchMemory,
-		deleteMemory,
-		setMemory,
-		fetchReadonly,
-	} from '$lib/api';
+	import { streamChat, fetchModel, fetchHistory, clearHistory, fetchTools, fetchMemory, deleteMemory, setMemory, fetchReadonly, uploadAudio } from '$lib/api';
+	import { AudioRecorder } from '$lib/audio';
 
 	// ── state ───────────────────────────────────────────────────────────────
 	let messages = $state<Message[]>([]);
@@ -22,6 +13,7 @@
 	let pendingAttachments = $state<Attachment[]>([]);
 	let inputText = $state('');
 	let isStreaming = $state(false);
+	let streamTokens = $state(0);
 
 	let threadId = $state('default');
 	let threads = $state<string[]>(['default']);
@@ -33,14 +25,19 @@
 	let modelName = $state('…');
 	let ttft = $state<number | null>(null);
 
-	let toolsOpen = $state(false);
-	let toolsList = $state<Tool[]>([]);
-	let memoryOpen = $state(false);
-	let memoryList = $state<MemoryNote[]>([]);
-	let newMemKey = $state('');
-	let newMemVal = $state('');
+			let toolsOpen = $state(false);
+		let toolsList = $state<Tool[]>([]);
+		let memoryOpen = $state(false);
+		let memoryList = $state<MemoryNote[]>([]);
+		let newMemKey = $state('');
+		let newMemVal = $state('');
+		let isRecording = $state(false);
+		let audioBlob: Blob | null = $state(null);
+		let audioUrl: string | null = $state(null);
+		let recordingTimer: ReturnType<typeof setTimeout> | null = null;
+		let recordingTime = $state(0);
 
-	let readonlyStatus = $state<ReadonlyStatus>({ readonly: false, pid: null, thread: null });
+		let readonlyStatus = $state<ReadonlyStatus>({ readonly: false, pid: null, thread: null });
 
 	// ── DOM refs ─────────────────────────────────────────────────────────────
 	let messagesEl = $state<HTMLElement | null>(null);
@@ -163,6 +160,7 @@
 		// Prepare streaming assistant message
 		streamingMessage = { role: 'assistant', content: '' };
 		isStreaming = true;
+		streamTokens = 0;
 		const t0 = performance.now();
 		let firstChunk = true;
 
@@ -176,6 +174,7 @@
 						ttft = (performance.now() - t0) / 1000;
 						firstChunk = false;
 					}
+					streamTokens += chunk.length;
 					streamingMessage = {
 						role: 'assistant',
 						content: (streamingMessage?.content ?? '') + chunk,
@@ -190,6 +189,9 @@
 					streamingMessage = { role: 'assistant', content: `**Error:** ${msg}` };
 				},
 			});
+		} catch (e) {
+			streamingMessage = { role: 'assistant', content: `**Error:** ${(e as Error).message}` };
+			await tick();
 		} finally {
 			if (streamingMessage) {
 				messages = [...messages, streamingMessage];
@@ -209,12 +211,55 @@
 		inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
 	}
 
-	function onKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter' && !e.shiftKey) {
-			e.preventDefault();
-			send();
+		function onKeydown(e: KeyboardEvent) {
+			if (e.key === 'Enter' && !e.shiftKey) {
+				e.preventDefault();
+				send();
+			}
 		}
-	}
+
+		// Audio recording
+		let audioRecorder: AudioRecorder | null = null;
+		
+		function startRecording() {
+			if (isStreaming || readonlyStatus.readonly) return;
+			
+			audioRecorder = new AudioRecorder();
+			audioRecorder.onRecordingChange = (isRecording) => {
+				isRecording = isRecording;
+			};
+			audioRecorder.onTimeUpdate = (time) => {
+				recordingTime = time;
+			};
+			audioRecorder.onAudioRecorded = async (blob) => {
+				// Convert to WAV format for better compatibility
+				const wavBlob = await convertToWav(blob);
+				addBlob(wavBlob, wavBlob.type);
+			};
+			
+			audioRecorder.startRecording().catch(err => {
+				console.error('Error starting recording:', err);
+				alert('Could not access microphone. Please check permissions.');
+			});
+		}
+		
+		function stopRecording() {
+			if (audioRecorder) {
+				audioRecorder.stopRecording();
+			}
+		}
+		
+		async function convertToWav(blob: Blob): Promise<Blob> {
+			// For now, we'll use the webm format directly
+			// In a real implementation, you might want to convert to WAV
+			return blob;
+		}
+		
+		function formatTime(seconds: number): string {
+			const mins = Math.floor(seconds / 60);
+			const secs = seconds % 60;
+			return `${mins}:${secs.toString().padStart(2, '0')}`;
+		}
 
 	function scrollBottom() {
 		if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -402,7 +447,7 @@
 	{/each}
 
 	{#if streamingMessage}
-		<ChatMessage message={streamingMessage} streaming />
+		<ChatMessage message={streamingMessage} streaming {streamTokens} />
 	{/if}
 </main>
 
@@ -418,31 +463,47 @@
 	</div>
 {/if}
 
-<!-- Input area -->
-<footer class="input-area">
-	<div class="input-row">
-		<button
-			class="btn btn-icon"
-			onclick={() => fileInputEl?.click()}
-			title="Attach image (or paste with Ctrl+V)"
-		>
-			&#x1f4ce;
-		</button>
-		<textarea
-			class="input-field"
-			bind:value={inputText}
-			bind:this={inputEl}
-			placeholder="Message light-claw… (Enter to send · Shift+Enter for newline · Ctrl+V to paste image)"
-			rows={1}
-			disabled={isStreaming || readonlyStatus.readonly}
-			onkeydown={onKeydown}
-			oninput={resizeTextarea}
-		></textarea>
-		<button class="btn btn-send" onclick={send} disabled={isStreaming || readonlyStatus.readonly} title="Send">→</button>
-	</div>
+	<!-- Input area -->
+	<footer class="input-area">
+		<div class="input-row">
+			<button
+				class="btn btn-icon"
+				onclick={() => fileInputEl?.click()}
+				title="Attach image (or paste with Ctrl+V)"
+			>
+				&#x1f4ce;
+			</button>
+			<button
+				class="btn btn-icon"
+				onclick={isRecording ? stopRecording : startRecording}
+				title={isRecording ? "Stop recording" : "Record audio"}
+				class:recording={isRecording}
+			>
+				{isRecording ? "&#x23F8;" : "&#x1f3a4;"}
+			</button>
+			<textarea
+				class="input-field"
+				bind:value={inputText}
+				bind:this={inputEl}
+				placeholder="Message light-claw… (Enter to send · Shift+Enter for newline · Ctrl+V to paste image)"
+				rows={1}
+				disabled={isStreaming || readonlyStatus.readonly || isRecording}
+				onkeydown={onKeydown}
+				oninput={resizeTextarea}
+			></textarea>
+			<button class="btn btn-send" onclick={send} disabled={isStreaming || readonlyStatus.readonly || isRecording} title="Send">→</button>
+		</div>
 
-	<StatusBar {tokens} {contextLength} {ttft} model={modelName} streaming={isStreaming} />
-</footer>
+		{#if isRecording}
+			<div class="recording-indicator">
+				<span class="recording-dot"></span>
+				<span>Recording: {formatTime(recordingTime)}</span>
+				<button class="btn btn-danger btn-small" onclick={stopRecording} title="Stop recording">Stop</button>
+			</div>
+		{/if}
+
+		<StatusBar {tokens} {contextLength} {ttft} model={modelName} streaming={isStreaming} />
+	</footer>
 
 <input
 	type="file"

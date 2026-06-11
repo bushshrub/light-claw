@@ -90,6 +90,31 @@ export async function fetchReadonly(): Promise<ReadonlyStatus> {
 	return r.json();
 }
 
+export interface AudioUploadResponse {
+	filename: string;
+	original_filename: string;
+	mime_type: string;
+	size: number;
+	file_path: string;
+	id: string;
+}
+
+export async function uploadAudio(file: File): Promise<AudioUploadResponse> {
+	const formData = new FormData();
+	formData.append('file', file);
+	
+	const response = await fetch('/api/v1/audio/upload', {
+		method: 'POST',
+		body: formData,
+	});
+	
+	if (!response.ok) {
+		throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+	}
+	
+	return response.json();
+}
+
 export async function streamChat(
 	message: string,
 	threadId: string,
@@ -144,4 +169,49 @@ export async function streamChat(
 			}
 		}
 	}
+}
+
+export async function processAudio(
+	file: File,
+	prompt: string = "Please analyze this audio file."
+): Promise<string> {
+	// First upload the audio file
+	const uploadResponse = await uploadAudio(file);
+	
+	// Then call the process_audio tool
+	const response = await fetch('/api/chat', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			message: prompt,
+			thread_id: 'default',
+			attachments: [{
+				type: 'audio',
+				data: btoa(await file.arrayBuffer()),
+				mime_type: file.type,
+				filename: file.name,
+				_url: uploadResponse.file_path,
+			}],
+		}),
+	});
+	
+	if (!response.ok) {
+		throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+	}
+	
+	const reader = response.body!.getReader();
+	const decoder = new TextDecoder();
+	let result = '';
+	
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		
+		result += decoder.decode(value, { stream: true });
+		// For now, just return the full result
+		// In a real implementation, you'd want to stream the response
+		break;
+	}
+	
+	return result;
 }

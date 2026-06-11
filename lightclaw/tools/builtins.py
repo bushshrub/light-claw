@@ -379,6 +379,104 @@ async def compact_conversation(thread_id: str = "default") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Audio processing tool for multimodal models
+# ---------------------------------------------------------------------------
+
+@_reg.tool(
+    description=(
+        "Process audio file with a multimodal LLM model. "
+        "Sends the audio file directly to the model's multimodal endpoint. "
+        "Requires LIGHTCLAW_NATIVE_AUDIO_MODE=true in config. "
+        "Supported formats: WAV, WebM, MP3, M4A, FLAC. "
+        "Returns the model's response to the audio."
+    )
+)
+async def process_audio(
+    audio_file_path: str,
+    prompt: str = "Please analyze this audio file.",
+    model: str | None = None,
+) -> str:
+    """Process audio file with a multimodal LLM model.
+    
+    Args:
+        audio_file_path: Path to the audio file to process
+        prompt: Instructions for the model about what to do with the audio
+        model: Optional model override (uses config model if not provided)
+        
+    Returns:
+        Model's response to the audio
+    """
+    from lightclaw.config import get_config
+    from lightclaw.llm import LLMClient
+    import base64
+    import json
+    
+    cfg = get_config()
+    
+    # Check if native audio mode is enabled
+    if not cfg.native_audio_mode:
+        return "Error: Native audio mode is not enabled. Set LIGHTCLAW_NATIVE_AUDIO_MODE=true in your .env file."
+    
+    # Check if file exists
+    if not _os.path.exists(audio_file_path):
+        return f"Error: Audio file not found: {audio_file_path}"
+    
+    # Read audio file
+    with open(audio_file_path, "rb") as f:
+        audio_data = f.read()
+    
+    # Determine MIME type from file extension
+    file_ext = audio_file_path.lower().split(".")[-1]
+    mime_types = {
+        "wav": "audio/wav",
+        "webm": "audio/webm",
+        "mp3": "audio/mpeg",
+        "m4a": "audio/mp4",
+        "flac": "audio/flac",
+        "ogg": "audio/ogg",
+    }
+    mime_type = mime_types.get(file_ext, f"audio/{file_ext}")
+    
+    # Encode as base64
+    audio_b64 = base64.b64encode(audio_data).decode("ascii")
+    
+    # Create multimodal message
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "audio_url",
+                    "audio_url": {
+                        "url": f"data:{mime_type};base64,{audio_b64}",
+                        "filename": _os.path.basename(audio_file_path),
+                    },
+                },
+            ],
+        }
+    ]
+    
+    # Use specified model or config model
+    model_name = model or cfg.model
+    
+    # Send to LLM client
+    try:
+        llm = LLMClient(cfg)
+        
+        # Try to use the multimodal endpoint
+        resp = await llm.chat(
+            messages=messages,
+            model=model_name,
+        )
+        
+        return resp.choices[0].message.content or "[No response from model]"
+        
+    except Exception as exc:
+        return f"Error processing audio: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Self-introspection tool
 # ---------------------------------------------------------------------------
 

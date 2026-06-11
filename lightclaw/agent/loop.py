@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextvars
 import json
+import os
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -38,8 +39,9 @@ class AgentLoop:
         return self._context_length
 
     # Each attachment dict has keys: type ("image"|"audio"|"video"|"other"),
-    # data (bytes), mime_type (str), filename (str).
+    # data (bytes), mime_type (str), filename (str), _url (str, for remote files).
     _SUPPORTED_IMAGE_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    _SUPPORTED_AUDIO_MIME = {"audio/wav", "audio/webm", "audio/mp3", "audio/mpeg", "audio/x-m4a", "audio/flac"}
 
     def _build_user_content(
         self,
@@ -72,15 +74,37 @@ class AgentLoop:
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"},
                 })
-            elif att_type in ("audio", "video"):
+            elif att_type == "audio" and data and mime in self._SUPPORTED_AUDIO_MIME:
+                # For audio, we need to handle it differently based on native audio mode
+                if self._cfg.native_audio_mode:
+                    # In native audio mode, we save the audio to a temporary file
+                    # and use the process_audio tool
+                    import tempfile
+                    import os
+                    
+                    # Create a temporary file for the audio
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{mime.split('/')[-1]}") as tmp:
+                        tmp.write(data)
+                        tmp_path = tmp.name
+                    
+                    # Store the temporary path for later processing
+                    # We'll need to clean this up later
+                    att["_temp_path"] = tmp_path
+                    
+                    parts.append({
+                        "type": "text",
+                        "text": f"[User attached audio: {filename}]",
+                    })
+                else:
+                    # In non-native mode, just note the audio attachment
+                    parts.append({
+                        "type": "text",
+                        "text": f"[User attached audio: {filename}]",
+                    })
+            elif att_type in ("video", "other"):
                 parts.append({
                     "type": "text",
                     "text": f"[User attached {att_type}: {filename}]",
-                })
-            else:
-                parts.append({
-                    "type": "text",
-                    "text": f"[User attached file: {filename}]",
                 })
 
         # If only text ended up in parts (e.g. all non-image attachments), flatten back
@@ -168,6 +192,13 @@ class AgentLoop:
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_content})
+
+        # Check if we have audio attachments and native audio mode is enabled
+        audio_attachments = []
+        if attachments and self._cfg.native_audio_mode:
+            for att in attachments:
+                if att.get("type") == "audio":
+                    audio_attachments.append(att)
 
         tools = self._registry.schemas()
         rounds = 0
@@ -270,6 +301,41 @@ class AgentLoop:
                         "tool_call_id": tool_id,
                         "content": result_str,
                     })
+
+                # Process audio attachments if native audio mode is enabled
+                if audio_attachments and self._cfg.native_audio_mode:
+                    for att in audio_attachments:
+                        temp_path = att.get("_temp_path")
+                        if temp_path and os.path.exists(temp_path):
+                            try:
+                                # Call the process_audio tool
+                                tool_result = await self._registry.call(
+                                    "process_audio",
+                                    {
+                                        "audio_file_path": temp_path,
+                                        "prompt": "Please analyze this audio file.",
+                                    }
+                                )
+                                
+                                # Add the audio processing result to the conversation
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": f"audio_{len(messages)}",
+                                    "content": f"Audio processing result: {tool_result}",
+                                })
+                                
+                                # Clean up temporary file
+                                os.unlink(temp_path)
+                                
+                            except Exception as exc:
+                                # Clean up temporary file on error
+                                if temp_path and os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": f"audio_error_{len(messages)}",
+                                    "content": f"Error processing audio: {exc}",
+                                })
 
             fallback = "[max tool rounds reached]"
             if self._workspace:

@@ -9,6 +9,7 @@ import platform
 import re
 import subprocess
 import tempfile
+from datetime import datetime
 from typing import Annotated, Any
 
 import typer
@@ -279,7 +280,7 @@ class ReplSession:
         self.job_manager = JobManager()
         self.routines = RoutineEngine()
         self.connectors = _ConnectorManager()
-        self.thread_id = "default"
+        self.thread_id = datetime.now().strftime("session_%Y%m%d_%H%M%S")
         self.last_ttft: float | None = None
         self.job_notification: str | None = None
 

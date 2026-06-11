@@ -67,6 +67,9 @@ class Config:
     discord_prefix: str = field(
         default_factory=lambda: os.environ.get("DISCORD_PREFIX", "lc")
     )
+    native_audio_mode: bool = field(
+        default_factory=lambda: os.environ.get("LIGHTCLAW_NATIVE_AUDIO_MODE", "false").lower() == "true"
+    )
 
 
 _default: Config | None = None

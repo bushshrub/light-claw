@@ -1,8 +1,13 @@
 <script lang="ts">
+	import { fade } from 'svelte/transition';
 	import type { Message } from '$lib/api';
 	import { renderMarkdown } from '$lib/markdown';
 
-	let { message, streaming = false }: { message: Message; streaming?: boolean } = $props();
+	let {
+		message,
+		streaming = false,
+		streamTokens = 0,
+	}: { message: Message; streaming?: boolean; streamTokens?: number } = $props();
 </script>
 
 <div class="message message-{message.role}" class:streaming>
@@ -18,10 +23,27 @@
 			<p class="user-text">{message.content}</p>
 		</div>
 	{:else}
-		<div class="assistant-content prose">
-			<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-			{@html renderMarkdown(message.content)}
-			{#if streaming}<span class="cursor">▋</span>{/if}
+		<div class="assistant-bubble">
+			<div class="assistant-content prose">
+				<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+				{@html renderMarkdown(message.content)}
+				{#if streaming}
+					{#if message.content === ''}
+						<div class="spinner" transition:fade={{ duration: 200 }}>
+							<span class="dot"></span>
+							<span class="dot"></span>
+							<span class="dot"></span>
+						</div>
+					{:else}
+						<span class="cursor">▋</span>
+					{/if}
+				{/if}
+			</div>
+			{#if streaming && message.content !== ''}
+				<div class="token-counter" transition:fade={{ duration: 200 }}>
+					Tokens: {streamTokens}
+				</div>
+			{/if}
 		</div>
 	{/if}
 </div>
@@ -77,11 +99,52 @@
 		display: block;
 	}
 
+	.assistant-bubble {
+		max-width: 100%;
+	}
+
 	.assistant-content {
 		max-width: 100%;
 		min-height: 1.5em;
 		color: var(--text);
 		line-height: 1.75;
+	}
+
+	.spinner {
+		display: inline-flex;
+		gap: 5px;
+		align-items: center;
+		padding: 6px 0;
+	}
+
+	.dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--cyan);
+		animation: bounce 1.2s ease-in-out infinite;
+	}
+
+	.dot:nth-child(2) {
+		animation-delay: 0.2s;
+	}
+
+	.dot:nth-child(3) {
+		animation-delay: 0.4s;
+	}
+
+	@keyframes bounce {
+		0%, 80%, 100% { transform: translateY(0); }
+		40% { transform: translateY(-7px); }
+	}
+
+	.token-counter {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--overlay0);
+		margin-top: 3px;
+		text-align: right;
+		user-select: none;
 	}
 
 	.cursor {

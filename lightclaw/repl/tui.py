@@ -136,10 +136,11 @@ class LightClawTUI(App):
 
     #statusbar {
         dock: bottom;
-        height: 1;
-        background: #111111;
-        color: #555555;
+        height: 2;
+        background: #1a1a1a;
+        color: #aaaaaa;
         padding: 0 1;
+        border-top: solid #333333;
         overflow: hidden;
     }
     """
@@ -155,6 +156,8 @@ class LightClawTUI(App):
         self._pending_attachments: list[dict[str, Any]] = []
         self._streaming_chars: int = 0
         self._selected_job_id: str | None = None
+        self._stream_start: float | None = None
+        self._got_first_token: bool = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -164,12 +167,12 @@ class LightClawTUI(App):
                 yield Static("─" * 22, id="jobs-divider")
                 yield ListView(id="jobs-list")
         yield Static("", id="active", markup=True)
-        yield Static("", id="statusbar", markup=True)
         yield Input(
             placeholder=f"({self._session.thread_id})",
             suggester=SuggestFromList(_SLASH_SUGGESTIONS, case_sensitive=False),
             id="input",
         )
+        yield Static("", id="statusbar", markup=True)
 
     async def on_mount(self) -> None:
         from lightclaw.console import set_tui_writer
@@ -178,7 +181,7 @@ class LightClawTUI(App):
         self._update_status()
         await self._update_jobs()
         self.set_interval(2.0, self._update_jobs)
-        self.set_interval(0.5, self._update_status)
+        self.set_interval(0.1, self._update_status)
         self.set_interval(10.0, self._update_lock)
         inp = self.query_one("#input", Input)
         inp.focus()
@@ -332,23 +335,27 @@ class LightClawTUI(App):
         pct = min(total / ctx * 100, 100) if total else 0.0
         bar_w = 20
         filled = round(pct / 100 * bar_w)
-        bar = "█" * filled + " " * (bar_w - filled)
+        bar = "█" * filled + "░" * (bar_w - filled)
         ctx_known = self._session.agent.context_length is not None
         est = "~" if not ctx_known else ""
         tok_label = f"{est}{total / 1000:.1f}K/{ctx / 1000:.1f}K"
         color = "green" if pct < 50 else "yellow" if pct < 80 else "red"
-        ttft_str = (
-            f"  ttft {self._session.last_ttft:.2f}s"
-            if self._session.last_ttft is not None
-            else ""
-        )
+        if self._stream_start is not None and not self._got_first_token:
+            elapsed = time.perf_counter() - self._stream_start
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            frame = frames[int(elapsed * 10) % len(frames)]
+            extra_str = f"  [cyan]{frame}[/cyan] [dim]{elapsed:.1f}s[/dim]"
+        elif self._session.last_ttft is not None:
+            extra_str = f"  [dim]ttft {self._session.last_ttft:.2f}s[/dim]"
+        else:
+            extra_str = ""
         attach_str = (
             f"  📎 {len(self._pending_attachments)}"
             if self._pending_attachments
             else ""
         )
         self.query_one("#statusbar", Static).update(
-            f" {tok_label}  [{color}]{bar}[/{color}]{ttft_str}{attach_str}"
+            f" {tok_label}  [{color}]{bar}[/{color}]{extra_str}{attach_str}"
         )
 
     # ── input helpers ───────────────────────────────────────────────────────
@@ -445,6 +452,8 @@ class LightClawTUI(App):
         active.add_class("streaming")
 
         start = time.perf_counter()
+        self._stream_start = start
+        self._got_first_token = False
         first_token_time: float | None = None
         response = ""
         last_render = 0.0
@@ -472,6 +481,7 @@ class LightClawTUI(App):
                 now = time.perf_counter()
                 if first_token_time is None:
                     first_token_time = now - start
+                    self._got_first_token = True
                 response += chunk
                 self._streaming_chars += len(chunk)
                 if now - last_render >= 0.05:
@@ -481,6 +491,8 @@ class LightClawTUI(App):
         except Exception as e:
             chat.write(f"[red bold]Error:[/red bold] {e}")
         finally:
+            self._stream_start = None
+            self._got_first_token = False
             self._streaming_chars = 0
             reset_issue_confirm_handler(confirm_token)
             active.remove_class("streaming")
