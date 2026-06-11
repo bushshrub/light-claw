@@ -22,9 +22,29 @@ class LLMClient:
     async def fetch_context_length(self) -> int | None:
         try:
             m = await self._client.models.retrieve(self._model)
-            return getattr(m, "context_window", None)
+            # Try typed attribute first (OpenAI, litellm)
+            ctx = getattr(m, "context_window", None)
+            if ctx:
+                return int(ctx)
+            # Dump to dict — catches pydantic model_extra and proxy-specific fields
+            raw: dict = {}
+            if hasattr(m, "model_dump"):
+                raw = m.model_dump()
+            elif hasattr(m, "__dict__"):
+                raw = vars(m)
+            for key in ("context_window", "max_context_length", "context_length", "n_ctx"):
+                v = raw.get(key)
+                if v:
+                    return int(v)
+            # llama.cpp: model.meta.n_ctx or model.meta.n_ctx_train
+            meta = raw.get("meta") or getattr(m, "meta", None)
+            if isinstance(meta, dict):
+                v = meta.get("n_ctx") or meta.get("n_ctx_train")
+                if v:
+                    return int(v)
         except Exception:
-            return None
+            pass
+        return None
 
     async def chat(
         self,

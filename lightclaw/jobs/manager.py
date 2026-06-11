@@ -102,6 +102,7 @@ class JobManager:
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
+            job.error = "cancelled (SIGINT or shutdown)"
         except Exception as exc:
             job.error = str(exc)
             job.status = "failed"

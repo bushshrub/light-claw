@@ -169,10 +169,11 @@ class RoutineEngine:
     async def _fire(self, routine: Routine) -> None:
         if self._jobs is None:
             return
+        job_id = f"routine_{routine.id}_{int(time.time())}"
         await self._jobs.submit(
             routine.prompt,
-            job_id=f"routine_{routine.id}_{int(time.time())}",
-            thread_id=routine.thread_id,
+            job_id=job_id,
+            thread_id=job_id,  # isolated per-run: no cross-contamination from prior runs
             source_routine_id=routine.id,
         )
 

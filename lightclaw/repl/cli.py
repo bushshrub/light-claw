@@ -6,14 +6,17 @@ import asyncio
 import mimetypes
 import os
 import re
+import time
 from typing import Annotated, Any
 
 import typer
+from rich.console import Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
 
 from lightclaw.agent import AgentLoop
 from lightclaw.config import Config, config_dir, get_config, set_config
@@ -25,6 +28,7 @@ from lightclaw.mcp import MCPManager
 from lightclaw.routines import RoutineEngine
 from lightclaw.scheduler import Scheduler
 from lightclaw.tools.registry import get_default_registry
+from lightclaw.tools.builtins import set_issue_confirm_handler, reset_issue_confirm_handler
 
 _EXT_MIME: dict[str, str] = {
     ".jpg": "image/jpeg",
@@ -350,46 +354,103 @@ async def _repl(config: Config) -> None:
             if not line and not attachments:
                 continue
 
+            stats_before = dict(session.agent.token_stats)
+            start_time = time.perf_counter()
+            first_token_time: float | None = None
             response_text = ""
-            live: Live | None = None
-            status = console.status("[dim]thinking...[/dim]")
-            status.start()
+            chunk_chars = 0
+
+            def _status_line(exact_msg: int | None = None) -> Text:
+                ctx_known = session.agent.context_length is not None
+                ctx = session.agent.context_length or 128_000
+                stats = session.agent.token_stats
+                session_total = stats.get("total", 0)
+                ttft = f"{first_token_time:.2f}s" if first_token_time is not None else "—"
+                if exact_msg is not None:
+                    tok_part = f"{exact_msg:,} tok"
+                else:
+                    approx = max(1, chunk_chars // 4)
+                    tok_part = f"~{approx:,} tok"
+                line = Text(style="dim")
+                line.append(f"ttft {ttft}  {tok_part}  session {session_total:,}  ")
+                pct = min(session_total / ctx * 100, 100)
+                bar_width = 20
+                filled = round(pct / 100 * bar_width)
+                bar = "█" * filled + "░" * (bar_width - filled)
+                bar_style = "green" if pct < 50 else "yellow" if pct < 80 else "red"
+                pct_label = f"~{pct:.1f}%" if not ctx_known else f"{pct:.1f}%"
+                line.append("[", style="dim")
+                line.append(bar, style=bar_style)
+                line.append(f"] {pct_label}", style="dim")
+                return line
+
+            live = Live(console=console, refresh_per_second=15)
+            live.start()
+            _live_stopped = False
+
+            async def _tick() -> None:
+                while first_token_time is None:
+                    elapsed = time.perf_counter() - start_time
+                    live.update(Text(f"⏱ {elapsed:.1f}s", style="dim"))
+                    await asyncio.sleep(0.05)
+
+            async def _confirm_with_live(
+                title: str, body_preview: str, tracker_name: str
+            ) -> bool:
+                nonlocal _live_stopped
+                if not _live_stopped:
+                    live.stop()
+                    _live_stopped = True
+                console.print(
+                    f"\n[cyan]\\[issue][/cyan] Ready to file on [bold]{tracker_name}[/bold]:"
+                )
+                console.print(f"  Title: {title}")
+                if body_preview:
+                    console.print(f"  Body: [dim]{body_preview[:300]}[/dim]")
+                ans = await asyncio.to_thread(
+                    lambda: Prompt.ask(
+                        "  File this issue?", choices=["y", "n"], default="n"
+                    )
+                )
+                return ans == "y"
+
+            tick_task = asyncio.create_task(_tick())
+            _confirm_token = set_issue_confirm_handler(_confirm_with_live)
+
             try:
                 async for chunk in session.agent.stream(
                     line, thread_id=session.thread_id, attachments=attachments or None
                 ):
                     if not chunk:
                         continue
-                    if live is None:
-                        status.stop()
-                        live = Live(
-                            Markdown(chunk),
-                            refresh_per_second=10,
-                            console=console,
-                        )
-                        live.start()
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter() - start_time
                     response_text += chunk
-                    live.update(Markdown(response_text))
+                    chunk_chars += len(chunk)
+                    if not _live_stopped:
+                        live.update(Group(Markdown(response_text), _status_line()))
+                    else:
+                        console.print(chunk, end="", highlight=False)
             except Exception:
-                if live is None:
-                    status.stop()
-                else:
+                tick_task.cancel()
+                if not _live_stopped:
                     live.stop()
                 raise
             else:
-                if live is None:
-                    status.stop()
-                else:
+                tick_task.cancel()
+                stats_after = session.agent.token_stats
+                msg_tok = stats_after.get("completion", 0) - stats_before.get("completion", 0)
+                if not _live_stopped:
+                    if response_text:
+                        live.update(
+                            Group(Markdown(response_text), _status_line(exact_msg=msg_tok))
+                        )
                     live.stop()
-
-            if response_text:
-                stats = session.agent.token_stats
-                ct = stats.get("completion", 0)
-                total = stats.get("total", 0)
-                if total > 0:
-                    console.print(
-                        f"[dim]↳ {ct:,} tok[/dim]"
-                    )
+                else:
+                    console.print()
+                    console.print(_status_line(exact_msg=msg_tok))
+            finally:
+                reset_issue_confirm_handler(_confirm_token)
     finally:
         await session.stop()
         console.print("[dim]Goodbye.[/dim]")

@@ -39,9 +39,10 @@ async def _default_confirm(title: str, body_preview: str, tracker_name: str) -> 
         return False
     console.print(f"\n[cyan]\\[issue][/cyan] Ready to file on [bold]{tracker_name}[/bold]:")
     console.print(f"  Title: {title}")
-    console.print(f"  Body preview: [dim]{body_preview[:300]}...[/dim]")
-    ans = input("  File this issue? [y/N] ").strip().lower()
-    return ans == "y"
+    if body_preview:
+        console.print(f"  Body: [dim]{body_preview[:300]}[/dim]")
+    ans = await asyncio.to_thread(input, "  File this issue? [y/N] ")
+    return ans.strip().lower() == "y"
 
 
 @_reg.tool(description="Remember a key-value note in persistent memory.")
