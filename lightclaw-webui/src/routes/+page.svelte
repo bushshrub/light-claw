@@ -3,7 +3,7 @@
 	import ChatMessage from '$lib/components/ChatMessage.svelte';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import Modal from '$lib/components/Modal.svelte';
-	import type { Message, Attachment, TokenStats, Tool, MemoryNote } from '$lib/api';
+	import type { Message, Attachment, TokenStats, Tool, MemoryNote, ReadonlyStatus } from '$lib/api';
 	import {
 		streamChat,
 		fetchModel,
@@ -13,6 +13,7 @@
 		fetchMemory,
 		deleteMemory,
 		setMemory,
+		fetchReadonly,
 	} from '$lib/api';
 
 	// ── state ───────────────────────────────────────────────────────────────
@@ -39,13 +40,16 @@
 	let newMemKey = $state('');
 	let newMemVal = $state('');
 
+	let readonlyStatus = $state<ReadonlyStatus>({ readonly: false, pid: null, thread: null });
+
 	// ── DOM refs ─────────────────────────────────────────────────────────────
 	let messagesEl = $state<HTMLElement | null>(null);
 	let inputEl = $state<HTMLTextAreaElement | null>(null);
 	let fileInputEl = $state<HTMLInputElement | null>(null);
 
 	// ── init + polling ───────────────────────────────────────────────────────
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let historyTimer: ReturnType<typeof setInterval> | null = null;
+	let readonlyTimer: ReturnType<typeof setInterval> | null = null;
 
 	onMount(async () => {
 		const info = await fetchModel();
@@ -55,6 +59,7 @@
 		const saved = localStorage.getItem('lc-threads');
 		if (saved) threads = JSON.parse(saved);
 
+		readonlyStatus = await fetchReadonly();
 		await loadHistory();
 		startPolling();
 	});
@@ -62,14 +67,27 @@
 	onDestroy(() => stopPolling());
 
 	function startPolling() {
-		if (pollTimer !== null) return;
-		pollTimer = setInterval(pollHistory, 2000);
+		if (historyTimer !== null) return;
+		historyTimer = setInterval(pollHistory, 2000);
+		readonlyTimer = setInterval(pollReadonly, 3000);
 	}
 
 	function stopPolling() {
-		if (pollTimer !== null) {
-			clearInterval(pollTimer);
-			pollTimer = null;
+		if (historyTimer !== null) {
+			clearInterval(historyTimer);
+			historyTimer = null;
+		}
+		if (readonlyTimer !== null) {
+			clearInterval(readonlyTimer);
+			readonlyTimer = null;
+		}
+	}
+
+	async function pollReadonly() {
+		try {
+			readonlyStatus = await fetchReadonly();
+		} catch {
+			// network error — keep last known state
 		}
 	}
 
@@ -127,6 +145,11 @@
 	async function send() {
 		const text = inputText.trim();
 		if ((!text && pendingAttachments.length === 0) || isStreaming) return;
+
+		if (readonlyStatus.readonly) {
+			alert(`Thread "${threadId}" is locked by the TUI (pid ${readonlyStatus.pid}). Switch to a different thread or close the TUI.`);
+			return;
+		}
 
 		inputText = '';
 		resizeTextarea();
@@ -302,6 +325,13 @@
 	<div class="thread-backdrop" role="button" tabindex="-1" onclick={() => (showThreadDropdown = false)} onkeydown={(e) => e.key === 'Escape' && (showThreadDropdown = false)}></div>
 {/if}
 
+<!-- Readonly banner -->
+{#if readonlyStatus.readonly}
+	<div class="readonly-banner">
+		Read-only — thread &ldquo;{readonlyStatus.thread}&rdquo; is active in TUI (pid {readonlyStatus.pid})
+	</div>
+{/if}
+
 <!-- Header -->
 <header class="header">
 	<span class="logo">light-claw</span>
@@ -404,11 +434,11 @@
 			bind:this={inputEl}
 			placeholder="Message light-claw… (Enter to send · Shift+Enter for newline · Ctrl+V to paste image)"
 			rows={1}
-			disabled={isStreaming}
+			disabled={isStreaming || readonlyStatus.readonly}
 			onkeydown={onKeydown}
 			oninput={resizeTextarea}
 		></textarea>
-		<button class="btn btn-send" onclick={send} disabled={isStreaming} title="Send">→</button>
+		<button class="btn btn-send" onclick={send} disabled={isStreaming || readonlyStatus.readonly} title="Send">→</button>
 	</div>
 
 	<StatusBar {tokens} {contextLength} {ttft} model={modelName} streaming={isStreaming} />
@@ -482,7 +512,17 @@
 		--radius:    8px;
 	}
 
-	:global(*) {
+	.readonly-banner {
+	background: var(--yellow);
+	color: var(--crust);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	padding: 6px 16px;
+	text-align: center;
+	flex-shrink: 0;
+}
+
+:global(*) {
 		box-sizing: border-box;
 		margin: 0;
 		padding: 0;

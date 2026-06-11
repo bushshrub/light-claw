@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lightclaw.agent import AgentLoop
-from lightclaw.config import Config, get_config
+from lightclaw.config import Config, TUI_LOCK_FILE, get_config
 from lightclaw.memory import Workspace
 from lightclaw.mcp import MCPManager
 from lightclaw.tools.registry import get_default_registry
@@ -69,6 +70,19 @@ def _get() -> WebSession:
     return _session
 
 
+def _tui_lock_for_thread(thread_id: str) -> str | None:
+    """Return the TUI lock owner PID if the given thread is locked by the TUI, else None."""
+    try:
+        with open(TUI_LOCK_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    locked_thread = data.get("thread")
+    if locked_thread and locked_thread == thread_id:
+        return str(data.get("pid", "?"))
+    return None
+
+
 def create_app(
     config: Config | None = None,
     workspace: Workspace | None = None,
@@ -97,6 +111,18 @@ def create_app(
     @app.post("/api/chat")
     async def chat(req: ChatRequest) -> StreamingResponse:
         session = _get()
+
+        lock_pid = _tui_lock_for_thread(req.thread_id)
+        if lock_pid is not None:
+            async def _locked():
+                yield f"data: {json.dumps({'error': f'Thread {req.thread_id!r} is locked by TUI (pid {lock_pid}). Open the TUI to release it or use a different thread.'})}\n\n"
+            return StreamingResponse(
+                _locked(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                status_code=423,
+            )
+
         attachments: list[dict[str, Any]] = []
         for att in req.attachments:
             if isinstance(att.get("data"), str):
@@ -135,6 +161,13 @@ def create_app(
 
     @app.delete("/api/history/{thread_id:path}")
     async def clear_history(thread_id: str):
+        lock_pid = _tui_lock_for_thread(thread_id)
+        if lock_pid is not None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                {"error": f"Thread {thread_id!r} is locked by TUI (pid {lock_pid})."},
+                status_code=423,
+            )
         await _get().workspace.clear_history(thread_id)
         return {"ok": True}
 
@@ -184,6 +217,15 @@ def create_app(
     async def delete_memory(key: str):
         ok = await _get().workspace.forget(key)
         return {"ok": ok}
+
+    @app.get("/api/readonly")
+    async def get_readonly():
+        try:
+            with open(TUI_LOCK_FILE) as f:
+                data = json.load(f)
+            return {"readonly": True, "pid": data.get("pid"), "thread": data.get("thread")}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {"readonly": False, "pid": None, "thread": None}
 
     @app.post("/api/upload")
     async def upload_file(file: UploadFile = File(...)):

@@ -27,6 +27,9 @@ def config_dir() -> str:
     return os.path.join(base, "lightclaw")
 
 
+TUI_LOCK_FILE = os.path.join(config_dir(), ".tui-active")
+
+
 @dataclass
 class Config:
     base_url: str = field(

@@ -79,6 +79,17 @@ export interface ChatChunkCallback {
 	onError: (msg: string) => void;
 }
 
+export interface ReadonlyStatus {
+	readonly: boolean;
+	pid: number | null;
+	thread: string | null;
+}
+
+export async function fetchReadonly(): Promise<ReadonlyStatus> {
+	const r = await fetch('/api/readonly');
+	return r.json();
+}
+
 export async function streamChat(
 	message: string,
 	threadId: string,

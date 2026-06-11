@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
+from lightclaw.config import TUI_LOCK_FILE
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -13,7 +16,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.suggester import SuggestFromList
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Input, ListItem, ListView, RichLog, Static
 
 if TYPE_CHECKING:
     from lightclaw.repl.cli import ReplSession
@@ -59,6 +62,10 @@ class LightClawTUI(App):
         scrollbar-size: 1 1;
     }
 
+    #chat:focus {
+        border: none;
+    }
+
     #sidebar {
         width: 26;
         padding: 0 1;
@@ -77,8 +84,21 @@ class LightClawTUI(App):
     }
 
     #jobs-list {
-        color: #777777;
+        height: 1fr;
         overflow-y: auto;
+    }
+
+    #jobs-list > .list-item {
+        padding: 0 1;
+        height: 2;
+    }
+
+    #jobs-list > .list-item:hover {
+        background: #1a1a1a;
+    }
+
+    #jobs-list > .list-item > .list-item__first {
+        color: #777777;
     }
 
     #active {
@@ -92,7 +112,8 @@ class LightClawTUI(App):
         display: none;
     }
 
-    #active.streaming {
+    #active.streaming,
+    #active.job-detail {
         display: block;
     }
 
@@ -119,6 +140,7 @@ class LightClawTUI(App):
         background: #111111;
         color: #555555;
         padding: 0 1;
+        overflow: hidden;
     }
     """
 
@@ -131,7 +153,8 @@ class LightClawTUI(App):
         super().__init__()
         self._session = session
         self._pending_attachments: list[dict[str, Any]] = []
-        self._streaming_chars: int = 0  # live char count; used for bar estimate during stream
+        self._streaming_chars: int = 0
+        self._selected_job_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -139,9 +162,8 @@ class LightClawTUI(App):
             with Vertical(id="sidebar"):
                 yield Static("jobs", id="jobs-title")
                 yield Static("─" * 22, id="jobs-divider")
-                yield Static("[dim]no jobs yet[/dim]", id="jobs-list", markup=True)
+                yield ListView(id="jobs-list")
         yield Static("", id="active", markup=True)
-        # statusbar first → docked to very bottom; Input second → just above statusbar
         yield Static("", id="statusbar", markup=True)
         yield Input(
             placeholder=f"({self._session.thread_id})",
@@ -149,13 +171,15 @@ class LightClawTUI(App):
             id="input",
         )
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         from lightclaw.console import set_tui_writer
         set_tui_writer(self._write_chat)
+        self._update_lock()
         self._update_status()
-        self._update_jobs()
+        await self._update_jobs()
         self.set_interval(2.0, self._update_jobs)
         self.set_interval(0.5, self._update_status)
+        self.set_interval(10.0, self._update_lock)
         inp = self.query_one("#input", Input)
         inp.focus()
         self.query_one("#chat", RichLog).write(Panel(
@@ -171,39 +195,145 @@ class LightClawTUI(App):
     def on_unmount(self) -> None:
         from lightclaw.console import set_tui_writer
         set_tui_writer(None)
+        self._remove_lock()
+
+    # ── lock file ───────────────────────────────────────────────────────────
+
+    def _lock_path(self) -> str:
+        return TUI_LOCK_FILE
+
+    def _update_lock(self) -> None:
+        pid = os.getpid()
+        thread = self._session.thread_id
+        try:
+            os.makedirs(os.path.dirname(self._lock_path()), exist_ok=True)
+            with open(self._lock_path(), "w") as f:
+                json.dump({"pid": pid, "thread": thread}, f)
+        except OSError:
+            pass
+
+    def _remove_lock(self) -> None:
+        try:
+            os.remove(self._lock_path())
+        except OSError:
+            pass
+
+    # ── chat ────────────────────────────────────────────────────────────────
 
     def _write_chat(self, content: Any) -> None:
         self.query_one("#chat", RichLog).write(content)
 
-    def _update_jobs(self) -> None:
+    # ── jobs list ───────────────────────────────────────────────────────────
+
+    async def _update_jobs(self) -> None:
         jobs = self._session.job_manager.list_all(limit=12)
+        lv = self.query_one("#jobs-list", ListView)
+
         if not jobs:
-            content = "[dim]no jobs yet[/dim]"
+            existing = list(lv.children)
+            if len(existing) != 1 or not isinstance(existing[0], ListItem) or getattr(existing[0], "data", None) is not None:
+                await lv.clear()
+                item = ListItem(Static("[dim]no jobs yet[/dim]", markup=True))
+                await lv.append(item)
+            return
+
+        existing_map: dict[str, ListItem] = {}
+        for child in list(lv.children):
+            if isinstance(child, ListItem):
+                jid = getattr(child, "data", None)
+                if jid is not None:
+                    existing_map[jid] = child
+
+        for j in jobs:
+            jid = j.id
+            if jid in existing_map:
+                self._update_list_item(existing_map[jid], j)
+            else:
+                item = await self._make_list_item(j)
+                await lv.append(item)
+                existing_map[jid] = item
+
+        # Remove stale items
+        seen = {j.id for j in jobs}
+        for child in list(lv.children):
+            if isinstance(child, ListItem):
+                jid = getattr(child, "data", None)
+                if jid is not None and jid not in seen:
+                    await child.remove()
+
+        # Restore selection
+        if self._selected_job_id is not None and self._selected_job_id in existing_map:
+            lv.index = list(lv.children).index(existing_map[self._selected_job_id])
+
+    async def _make_list_item(self, job: Any) -> ListItem:
+        label = self._job_label(job)
+        item = ListItem(Static(label, markup=True))
+        item.data = job.id
+        return item
+
+    def _update_list_item(self, item: ListItem, job: Any) -> None:
+        label = self._job_label(job)
+        if item.children:
+            item.children[0].update(label)
+
+    @staticmethod
+    def _job_label(job: Any) -> str:
+        if job.status == "completed":
+            icon, color = "✓", "green"
+        elif job.status == "failed":
+            icon, color = "✗", "red"
         else:
-            lines: list[str] = []
-            for j in jobs:
-                if j.status == "completed":
-                    icon, color = "✓", "green"
-                elif j.status == "failed":
-                    icon, color = "✗", "red"
-                else:
-                    icon, color = "⏳", "cyan"
-                name = j.id if len(j.id) <= 22 else j.id[:19] + "..."
-                lines.append(f"[{color}]{icon}[/{color}] [dim]{name}[/dim]")
-                lines.append(f"  [dim]{j.elapsed}[/dim]")
-            content = "\n".join(lines)
-        self.query_one("#jobs-list", Static).update(content)
+            icon, color = "⏳", "cyan"
+        name = job.id if len(job.id) <= 20 else job.id[:17] + "..."
+        return f"[{color}]{icon}[/{color}] [dim]{name}[/dim]\n  [dim]{job.elapsed}[/dim]"
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if item is None:
+            return
+        job_id = item.data if hasattr(item, "data") else None
+        if job_id is None:
+            return
+        self._show_job_details(job_id)
+
+    def _show_job_details(self, job_id: str) -> None:
+        jobs = self._session.job_manager.list_all()
+        job = next((j for j in jobs if j.id == job_id), None)
+        active = self.query_one("#active", Static)
+        active.remove_class("streaming")
+        if job is None:
+            active.update(f"[red]Job {job_id!r} not found[/red]")
+            active.add_class("job-detail")
+            self._selected_job_id = job_id
+            return
+        self._selected_job_id = job_id
+        lines = [
+            f"[bold cyan]Job:[/bold cyan] {job.id}",
+            f"[bold]Status:[/bold] [{_job_status_color(job.status)}]{job.status}[/{_job_status_color(job.status)}]",
+            f"[bold]Elapsed:[/bold] {job.elapsed}",
+        ]
+        if job.prompt:
+            lines.append(f"[bold]Prompt:[/bold]\n{dim(job.prompt)}")
+        if job.error:
+            lines.append(f"\n[bold red]Error:[/bold red]\n{job.error}")
+        elif job.result:
+            lines.append(f"\n[bold]Result:[/bold]")
+            text = job.result[:2000]
+            lines.append(text)
+        active.update("\n".join(lines))
+        active.add_class("job-detail")
+
+    # ── status bar ──────────────────────────────────────────────────────────
 
     def _update_status(self) -> None:
         stats = self._session.agent.token_stats
-        # During streaming, add a rough char→token estimate so the bar moves live
         total = stats.get("total", 0) + self._streaming_chars // 4
-        ctx_known = self._session.agent.context_length is not None
         ctx = self._session.agent.context_length or 128_000
         pct = min(total / ctx * 100, 100) if total else 0.0
         bar_w = 20
         filled = round(pct / 100 * bar_w)
         bar = "█" * filled + " " * (bar_w - filled)
+        ctx_known = self._session.agent.context_length is not None
         est = "~" if not ctx_known else ""
         tok_label = f"{est}{total / 1000:.1f}K/{ctx / 1000:.1f}K"
         color = "green" if pct < 50 else "yellow" if pct < 80 else "red"
@@ -220,6 +350,8 @@ class LightClawTUI(App):
         self.query_one("#statusbar", Static).update(
             f" {tok_label}  [{color}]{bar}[/{color}]{ttft_str}{attach_str}"
         )
+
+    # ── input helpers ───────────────────────────────────────────────────────
 
     def _update_prompt_placeholder(self) -> None:
         inp = self.query_one("#input", Input)
@@ -247,16 +379,13 @@ class LightClawTUI(App):
 
         chat = self.query_one("#chat", RichLog)
 
-        # Handle /quit before handle_slash so no KeyboardInterrupt propagates
         if text.lower() in ("/quit", "/exit"):
             await self.action_quit()
             return
 
-        # Expand /suggest to its full prompt
         if text.lower() == "/suggest":
             text = _SUGGEST_PROMPT
 
-        # /paste in TUI — handled here (not via handle_slash)
         if text.lower().startswith("/paste"):
             parts = text.split(None, 1)
             sub = parts[1].lower() if len(parts) > 1 else ""
@@ -269,7 +398,6 @@ class LightClawTUI(App):
                 self.action_paste_image()
             return
 
-        # Other slash commands
         if text.startswith("/"):
             chat.write(
                 Text.assemble(
@@ -285,8 +413,8 @@ class LightClawTUI(App):
                     chat.write(f"[red]Unknown command: {text}[/red]")
             except KeyboardInterrupt:
                 await self.action_quit()
-            # Refresh placeholder in case thread changed
             self._update_prompt_placeholder()
+            self._update_lock()
             return
 
         # Normal message — stream
@@ -313,12 +441,13 @@ class LightClawTUI(App):
 
         active = self.query_one("#active", Static)
         chat = self.query_one("#chat", RichLog)
+        active.remove_class("job-detail")
         active.add_class("streaming")
 
         start = time.perf_counter()
         first_token_time: float | None = None
         response = ""
-        last_render = 0.0  # wall-clock time of last active.update() call
+        last_render = 0.0
         stats_before = dict(self._session.agent.token_stats)
         self._streaming_chars = 0
 
@@ -345,11 +474,9 @@ class LightClawTUI(App):
                     first_token_time = now - start
                 response += chunk
                 self._streaming_chars += len(chunk)
-                # Re-render the streaming preview at most every 50 ms to avoid flicker
                 if now - last_render >= 0.05:
                     active.update(Markdown(response))
                     last_render = now
-                # Update status bar on every chunk — keeps bar moving live
                 self._update_status()
         except Exception as e:
             chat.write(f"[red bold]Error:[/red bold] {e}")
@@ -381,9 +508,12 @@ class LightClawTUI(App):
                 )
             )
             self._update_status()
-            self._update_jobs()
+            await self._update_jobs()
 
-            # Auto-compact if context is high
+            # Re-show job details if a job was selected before streaming
+            if self._selected_job_id is not None:
+                self._show_job_details(self._selected_job_id)
+
             if total > 0 and pct / 100 > _COMPACT_THRESHOLD:
                 chat.write(
                     f"[yellow]Context at {pct:.0f}% — compacting...[/yellow]"
@@ -402,6 +532,14 @@ class LightClawTUI(App):
         if n:
             chat.write(f"[green]  ✓ Compacted {n} messages. Context reset.[/green]")
         self._update_status()
+
+
+def _job_status_color(status: str) -> str:
+    return {"completed": "green", "failed": "red", "running": "cyan", "cancelled": "yellow"}.get(status, "white")
+
+
+def dim(text: str) -> str:
+    return f"[dim]{text}[/dim]"
 
 
 async def run_tui(session: "ReplSession") -> None:
