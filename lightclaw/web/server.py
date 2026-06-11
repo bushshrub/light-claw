@@ -1,0 +1,192 @@
+"""FastAPI web server for light-claw."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from lightclaw.agent import AgentLoop
+from lightclaw.config import Config, get_config
+from lightclaw.memory import Workspace
+from lightclaw.mcp import MCPManager
+from lightclaw.tools.registry import get_default_registry
+
+WEBUI_DIR = Path(__file__).parent.parent.parent / "lightclaw-webui"
+
+
+class ChatRequest(BaseModel):
+    message: str
+    thread_id: str = "default"
+    attachments: list[dict[str, Any]] = []
+
+
+class MemorySetRequest(BaseModel):
+    key: str
+    value: str
+
+
+class WebSession:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.workspace = Workspace(config)
+        self.registry = get_default_registry()
+        self.mcp = MCPManager()
+        self.agent = AgentLoop(config, self.registry, self.workspace)
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        await self.workspace.open()
+        await self.mcp.start(self.registry)
+
+    async def stop(self) -> None:
+        await self.mcp.stop()
+        await self.workspace.close()
+
+
+_session: WebSession | None = None
+
+
+def _get() -> WebSession:
+    if _session is None:
+        raise RuntimeError("session not initialized")
+    return _session
+
+
+def create_app(config: Config | None = None) -> FastAPI:
+    global _session
+    cfg = config or get_config()
+    _session = WebSession(cfg)
+
+    app = FastAPI(title="light-claw")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        await _get().start()
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await _get().stop()
+
+    @app.post("/api/chat")
+    async def chat(req: ChatRequest) -> StreamingResponse:
+        session = _get()
+        attachments: list[dict[str, Any]] = []
+        for att in req.attachments:
+            if isinstance(att.get("data"), str):
+                att = dict(att)
+                try:
+                    att["data"] = base64.b64decode(att["data"])
+                except Exception:
+                    att.pop("data", None)
+            attachments.append(att)
+
+        async def generate():
+            async with session._lock:
+                try:
+                    async for chunk in session.agent.stream(
+                        req.message,
+                        thread_id=req.thread_id,
+                        attachments=attachments or None,
+                    ):
+                        yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                    stats = session.agent.token_stats
+                    ctx = session.agent.context_length
+                    yield f"data: {json.dumps({'done': True, 'tokens': stats, 'context_length': ctx})}\n\n"
+                except Exception as exc:
+                    yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/history/{thread_id:path}")
+    async def get_history(thread_id: str):
+        messages = await _get().workspace.get_history(thread_id)
+        return {"messages": messages}
+
+    @app.delete("/api/history/{thread_id:path}")
+    async def clear_history(thread_id: str):
+        await _get().workspace.clear_history(thread_id)
+        return {"ok": True}
+
+    @app.get("/api/tools")
+    def get_tools():
+        session = _get()
+        return {
+            "tools": [
+                {
+                    "name": s["function"]["name"],
+                    "description": s["function"].get("description", ""),
+                }
+                for s in session.registry.schemas()
+            ]
+        }
+
+    @app.get("/api/model")
+    async def get_model():
+        session = _get()
+        ctx = session.agent.context_length
+        if ctx is None:
+            try:
+                ctx = await session.agent._llm.fetch_context_length()
+            except Exception:
+                pass
+        return {"model": cfg.model, "base_url": cfg.base_url, "context_length": ctx}
+
+    @app.get("/api/tokens")
+    def get_tokens():
+        session = _get()
+        return {
+            "tokens": session.agent.token_stats,
+            "context_length": session.agent.context_length,
+        }
+
+    @app.get("/api/memory")
+    async def list_memory():
+        notes = await _get().workspace.list_notes()
+        return {"notes": notes}
+
+    @app.post("/api/memory")
+    async def set_memory(req: MemorySetRequest):
+        await _get().workspace.remember(req.key, req.value)
+        return {"ok": True}
+
+    @app.delete("/api/memory/{key}")
+    async def delete_memory(key: str):
+        ok = await _get().workspace.forget(key)
+        return {"ok": ok}
+
+    @app.post("/api/upload")
+    async def upload_file(file: UploadFile = File(...)):
+        data = await file.read()
+        mime = file.content_type or "application/octet-stream"
+        b64 = base64.b64encode(data).decode("ascii")
+        return {
+            "filename": file.filename,
+            "mime_type": mime,
+            "data": b64,
+            "size": len(data),
+        }
+
+    # Frontend static files — must be registered last
+    if WEBUI_DIR.exists():
+        app.mount("/", StaticFiles(directory=str(WEBUI_DIR), html=True), name="static")
+
+    return app

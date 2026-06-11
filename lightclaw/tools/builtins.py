@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import os as _os
 import sys
 import traceback
 from collections.abc import Awaitable, Callable
@@ -12,6 +13,11 @@ from lightclaw.console import console
 from lightclaw.tools.registry import get_default_registry
 
 _reg = get_default_registry()
+
+# Project root: two dirs up from lightclaw/tools/
+_LIGHTCLAW_SRC_ROOT = _os.path.abspath(
+    _os.path.join(_os.path.dirname(__file__), "..", "..")
+)
 
 # ---------------------------------------------------------------------------
 # Issue confirmation handler (pluggable, ContextVar-based)
@@ -326,3 +332,70 @@ async def lightclaw_system_report_issue(
         return f"Issue filed: {url}"
     except Exception as exc:
         return f"Failed to file issue: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Self-introspection tool
+# ---------------------------------------------------------------------------
+
+_SRC_SKIP = frozenset({
+    ".git", "__pycache__", ".venv", "venv", "node_modules",
+    ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build",
+})
+_SRC_SKIP_EXTS = frozenset({".pyc", ".pyo", ".egg-info"})
+
+
+@_reg.tool(
+    description=(
+        "Read lightclaw's own source code for self-analysis and improvement suggestions. "
+        "path='' lists the project tree (up to 3 levels deep). "
+        "path='lightclaw/tools/builtins.py' reads that specific file. "
+        "Use this to understand the current implementation before suggesting improvements. "
+        "Directory listings show [dir] or [file] prefixes. "
+        "File content is capped at 8 000 characters. "
+        "Sensitive files (.env, secrets) are blocked."
+    )
+)
+def lightclaw_read_source(path: str = "") -> str:
+    _BLOCKED = {".env", ".env.local", "secrets", "credentials"}
+
+    base = _LIGHTCLAW_SRC_ROOT
+    target = _os.path.normpath(_os.path.join(base, path)) if path else base
+
+    if not target.startswith(base):
+        return "Error: path escapes project root"
+
+    fname = _os.path.basename(target)
+    if fname in _BLOCKED or fname.startswith(".env"):
+        return "Error: file is blocked for security"
+
+    if _os.path.isdir(target):
+        lines: list[str] = []
+        for root, dirs, files in _os.walk(target):
+            dirs[:] = sorted(d for d in dirs if d not in _SRC_SKIP)
+            rel = _os.path.relpath(root, base)
+            depth = 0 if rel == "." else rel.count(_os.sep) + 1
+            if depth > 3:
+                dirs.clear()
+                continue
+            indent = "  " * depth
+            folder = _os.path.basename(root) if depth else "."
+            lines.append(f"{indent}{folder}/")
+            for f in sorted(files):
+                if _os.path.splitext(f)[1] not in _SRC_SKIP_EXTS:
+                    lines.append(f"{indent}  {f}")
+        return "\n".join(lines)[:8000]
+
+    if _os.path.isfile(target):
+        if _os.path.splitext(target)[1] in _SRC_SKIP_EXTS:
+            return "Error: binary/compiled file"
+        try:
+            with open(target, encoding="utf-8", errors="replace") as f:
+                content = f.read(8000)
+            if len(content) == 8000:
+                content += "\n... [truncated at 8000 chars]"
+            return content
+        except OSError as exc:
+            return f"Read error: {exc}"
+
+    return f"Not found: {path!r}"

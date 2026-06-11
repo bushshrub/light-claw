@@ -1,0 +1,62 @@
+[
+  {
+    "id": "summarize",
+    "description": "Summarize a piece of text for a target audience",
+    "prompt": "Summarize the following text for {audience}. Be concise.\n\nText:\n{text}",
+    "params": ["text", "audience"]
+  },
+  {
+    "id": "translate",
+    "description": "Translate text into another language",
+    "prompt": "Translate the following text into {language}. Output only the translation.\n\nText:\n{text}",
+    "params": ["text", "language"]
+  },
+  {
+    "id": "explain",
+    "description": "Explain a concept in simple terms",
+    "prompt": "Explain the following concept in simple, clear terms. Avoid jargon. Use an analogy if helpful.\n\nConcept: {concept}",
+    "params": ["concept"]
+  },
+  {
+    "id": "code-review",
+    "description": "Review a code snippet for bugs, clarity, and style",
+    "prompt": "Review the following {language} code. Report: bugs, edge cases, clarity issues, and style problems. Be direct and specific. No praise.\n\n```{language}\n{code}\n```",
+    "params": ["code", "language"]
+  },
+  {
+    "id": "brainstorm",
+    "description": "Generate ideas on a topic",
+    "prompt": "Brainstorm {count} ideas for: {topic}\n\nBe creative and specific. Output as a numbered list.",
+    "params": ["topic", "count"]
+  },
+  {
+    "id": "daily-brief",
+    "description": "Generate a daily briefing from memory and todos",
+    "prompt": "Generate a concise daily briefing. Use todo_list to get pending tasks, memory_search to find any recent notes or goals, and calendar_list to check today's events. Summarise: what is due today, what is high priority, and any events scheduled.",
+    "params": []
+  },
+  {
+    "id": "write-email",
+    "description": "Draft a professional email",
+    "prompt": "Write a professional email.\n\nTo: {to}\nSubject: {subject}\nContext: {context}\n\nTone: professional but friendly. Be concise. Output only the email body.",
+    "params": ["to", "subject", "context"]
+  },
+  {
+    "id": "debug",
+    "description": "Diagnose and suggest a fix for a code error",
+    "prompt": "Diagnose the following error and suggest a fix.\n\nLanguage: {language}\n\nError:\n{error}\n\nCode context:\n```{language}\n{code}\n```",
+    "params": ["language", "error", "code"]
+  },
+  {
+    "id": "meeting-notes",
+    "description": "Summarize raw meeting notes into action items and decisions",
+    "prompt": "Process these meeting notes into a clean summary.\n\nOutput sections:\n1. Key decisions\n2. Action items (owner + deadline if mentioned)\n3. Open questions\n\nNotes:\n{notes}",
+    "params": ["notes"]
+  },
+  {
+    "id": "commit-message",
+    "description": "Generate a conventional commit message from a diff or description",
+    "prompt": "Write a conventional commit message for the following change. Format: `type(scope): subject` with an optional body explaining why (not what). Keep subject under 50 chars.\n\nChange:\n{change}",
+    "params": ["change"]
+  }
+]

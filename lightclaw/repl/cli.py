@@ -5,11 +5,19 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import os
+import platform
 import re
+import subprocess
+import tempfile
 import time
 from typing import Annotated, Any
 
 import typer
+from prompt_toolkit import PromptSession as _PTSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML as _HTML
+from prompt_toolkit.key_binding import KeyBindings as _KB
+from prompt_toolkit.styles import Style as _PTStyle
 from rich.console import Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -64,13 +72,122 @@ def _parse_attachments(line: str) -> tuple[str, list[dict[str, Any]]]:
     return line, attachments
 
 
+def _read_clipboard_image() -> tuple[bytes, str] | None:
+    """Read image from clipboard. Returns (bytes, mime_type) or None.
+
+    macOS: uses osascript to write PNG/JPEG clipboard data to a temp file.
+    Linux: uses xclip.
+    """
+    sys = platform.system()
+    if sys == "Darwin":
+        for cls, ext, mime in [
+            ("«class PNGf»", ".png", "image/png"),
+            ("JPEG picture", ".jpg", "image/jpeg"),
+        ]:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False, prefix="lc_clip_") as tmp:
+                tmp_path = tmp.name
+            script = (
+                f"try\n"
+                f"  set d to (the clipboard as {cls})\n"
+                f"  set f to open for access POSIX file \"{tmp_path}\" with write permission\n"
+                f"  set eof f to 0\n"
+                f"  write d to f\n"
+                f"  close access f\n"
+                f"  return \"ok\"\n"
+                f"on error\n"
+                f"  return \"\"\n"
+                f"end try"
+            )
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.stdout.strip() == "ok":
+                    with open(tmp_path, "rb") as f:
+                        data = f.read()
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    if data:
+                        return data, mime
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    elif sys == "Linux":
+        for mime in ("image/png", "image/jpeg"):
+            try:
+                result = subprocess.run(
+                    ["xclip", "-sel", "clip", "-t", mime, "-o"],
+                    capture_output=True, timeout=3,
+                )
+                if result.returncode == 0 and len(result.stdout) > 8:
+                    return result.stdout, mime
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+    return None
+
+
+class _SlashCompleter(Completer):
+    _CMDS: list[tuple[str, str]] = [
+        ("/clear",          "clear conversation history"),
+        ("/help",           "show help"),
+        ("/history",        "show conversation history"),
+        ("/jobs cancel ",   "/jobs cancel <id>"),
+        ("/jobs list",      "list background jobs"),
+        ("/jobs logs ",     "/jobs logs <id>"),
+        ("/jobs run ",      "/jobs run <prompt>"),
+        ("/memory del ",    "/memory del <key>"),
+        ("/memory list",    "list stored notes"),
+        ("/memory search ", "/memory search <q>"),
+        ("/memory set ",    "/memory set <key> <value>"),
+        ("/model",          "show model info"),
+        ("/paste",          "paste image from clipboard"),
+        ("/paste clear",    "clear pending image attachments"),
+        ("/quit",           "exit"),
+        ("/routines list",   "list routines"),
+        ("/routines run ",   "/routines run <id>"),
+        ("/schedule add ",   "/schedule add <id> <cron> <prompt>"),
+        ("/skills install ", "/skills install <id>"),
+        ("/skills list",     "list installed skills"),
+        ("/skills remove ",  "/skills remove <id>"),
+        ("/skills run ",     "/skills run <id> [key=val ...]"),
+        ("/skills search ",  "/skills search <query>"),
+        ("/schedule list",  "list scheduled tasks"),
+        ("/schedule rm ",   "/schedule rm <id>"),
+        ("/session",        "show token usage"),
+        ("/suggest",        "ask the agent to analyse its source and suggest improvements"),
+        ("/thread ",        "/thread <id>"),
+        ("/tools",          "list registered tools"),
+    ]
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        for insert, desc in self._CMDS:
+            if insert.startswith(text):
+                yield Completion(
+                    insert,
+                    start_position=-len(text),
+                    display=insert.rstrip(),
+                    display_meta=desc,
+                )
+
+
 app = typer.Typer(help="light-claw: local agent OS", no_args_is_help=False)
 mcp_app = typer.Typer(help="Manage MCP servers")
 jobs_app = typer.Typer(help="Background jobs")
 routines_app = typer.Typer(help="Persistent routines (cron + events)")
+skills_app = typer.Typer(help="Manage and download skills")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(routines_app, name="routines")
+app.add_typer(skills_app, name="skills")
 
 SLASH_HELP = """
 [bold]Slash commands[/bold]
@@ -84,19 +201,101 @@ SLASH_HELP = """
   [cyan]/tools[/cyan]                         list registered tools (incl. MCP)
   [cyan]/history[/cyan]                       show conversation history
   [cyan]/clear[/cyan]                         clear conversation history
+  [cyan]/paste[/cyan]                         attach image from clipboard (or Ctrl+Y)
+  [cyan]/paste clear[/cyan]                   discard pending image attachments
   [cyan]/jobs list[/cyan]                     list background jobs
   [cyan]/jobs logs <id>[/cyan]                show job result/error
   [cyan]/jobs cancel <id>[/cyan]              cancel a running job
   [cyan]/jobs run <prompt>[/cyan]             submit prompt as background job
   [cyan]/routines list[/cyan]                 list persistent routines
   [cyan]/routines run <id>[/cyan]             trigger routine immediately
+  [cyan]/skills list[/cyan]                   list installed skills
+  [cyan]/skills search <q>[/cyan]             search remote skills registry
+  [cyan]/skills install <id>[/cyan]           download and install a skill
+  [cyan]/skills remove <id>[/cyan]            delete an installed skill
+  [cyan]/skills run <id> [key=val ...][/cyan] run a skill with params
   [cyan]/schedule list[/cyan]                 list in-session scheduled tasks
   [cyan]/schedule add <id> <m h d M dow> <prompt>[/cyan]
                                  schedule agent prompt on cron
   [cyan]/schedule rm <id>[/cyan]              remove scheduled task
+  [cyan]/suggest[/cyan]                       ask the agent to analyse its source and suggest improvements
+  [cyan]/connectors list[/cyan]              list connectors (discord, signal) and status
+  [cyan]/connectors enable <name>[/cyan]     start a connector in the background
+  [cyan]/connectors disable <name>[/cyan]    stop a running connector
   [cyan]/thread <id>[/cyan]                   switch conversation thread
   [cyan]/quit[/cyan]                          exit
+
+[bold]Image paste[/bold]
+  Copy an image to clipboard, then press [cyan]Ctrl+Y[/cyan] or type [cyan]/paste[/cyan].
+  Pending images are shown in the toolbar (📎 N) and sent with your next message.
+  Attach files directly with [cyan]@/absolute/path[/cyan] in your message.
 """
+
+_CONNECTOR_NAMES = ("discord", "signal")
+
+
+class _ConnectorManager:
+    """Manages background connector (Discord, Signal) tasks within the REPL."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict] = {}
+
+    def status(self, name: str) -> str:
+        entry = self._entries.get(name)
+        if entry is None:
+            return "stopped"
+        return "running" if not entry["task"].done() else "stopped"
+
+    def list(self) -> list[tuple[str, str]]:
+        return [(name, self.status(name)) for name in _CONNECTOR_NAMES]
+
+    async def enable(
+        self, name: str, cfg: "Config", workspace: "Workspace", registry: Any
+    ) -> str:
+        if self.status(name) == "running":
+            return f"{name} already running"
+
+        if name == "discord":
+            token = os.environ.get("DISCORD_BOT_TOKEN")
+            if not token:
+                return "DISCORD_BOT_TOKEN not set — export it or add to .env"
+            from lightclaw.channels import DiscordBot
+            bot = DiscordBot(token, cfg, workspace, registry)
+            task = asyncio.create_task(bot.start(), name=f"connector_discord")
+            self._entries["discord"] = {"bot": bot, "task": task}
+            return "discord connector started"
+
+        if name == "signal":
+            phone = os.environ.get("SIGNAL_PHONE_NUMBER")
+            if not phone:
+                return "SIGNAL_PHONE_NUMBER not set — export it or add to .env"
+            sig_cfg_dir = os.environ.get("SIGNAL_CONFIG_DIR")
+            from lightclaw.channels.signal_bot import SignalBot
+            bot = SignalBot(phone, sig_cfg_dir, cfg, workspace, registry)
+            task = asyncio.create_task(bot.start(), name=f"connector_signal")
+            self._entries["signal"] = {"bot": bot, "task": task}
+            return "signal connector started"
+
+        return f"unknown connector {name!r} — available: {', '.join(_CONNECTOR_NAMES)}"
+
+    async def disable(self, name: str) -> str:
+        if name not in _CONNECTOR_NAMES:
+            return f"unknown connector {name!r} — available: {', '.join(_CONNECTOR_NAMES)}"
+        if self.status(name) != "running":
+            return f"{name} is not running"
+        entry = self._entries[name]
+        await entry["bot"].close()
+        entry["task"].cancel()
+        return f"{name} connector stopped"
+
+    async def stop_all(self) -> None:
+        for name in list(self._entries):
+            if self.status(name) == "running":
+                try:
+                    await self._entries[name]["bot"].close()
+                    self._entries[name]["task"].cancel()
+                except Exception:
+                    pass
 
 
 class ReplSession:
@@ -106,20 +305,25 @@ class ReplSession:
         self.registry = get_default_registry()
         self.mcp = MCPManager()
         self.agent = AgentLoop(config, self.registry, self.workspace)
+        self._job_agent = AgentLoop(config, self.registry, self.workspace)
         self.scheduler = Scheduler()
         self.job_manager = JobManager()
         self.routines = RoutineEngine()
+        self.connectors = _ConnectorManager()
         self.thread_id = "default"
+        self.last_ttft: float | None = None
+        self.job_notification: str | None = None
 
     async def start(self) -> None:
         await self.workspace.open()
         await self.mcp.start(self.registry)
         self.scheduler.start()
-        self.job_manager.set_agent(self.agent)
+        self.job_manager.set_agent(self._job_agent)
         self.job_manager.on_done(self._on_job_done)
         await self.routines.start(self.job_manager)
 
     async def stop(self) -> None:
+        await self.connectors.stop_all()
         self.routines.stop()
         self.scheduler.stop()
         await self.mcp.stop()
@@ -127,10 +331,7 @@ class ReplSession:
 
     def _on_job_done(self, job) -> None:
         icon = "✓" if job.status == "completed" else "✗"
-        console.print(
-            f"\n[dim]{icon} job [cyan]{job.id}[/cyan] {job.status} "
-            f"({job.elapsed}) — /jobs logs {job.id}[/dim]"
-        )
+        self.job_notification = f"{icon} {job.id} {job.status} ({job.elapsed})"
 
     async def handle_slash(self, line: str) -> bool:
         parts = line.strip().split(None, 3)
@@ -288,6 +489,114 @@ class ReplSession:
                 console.print("[red]Usage: /routines list|run[/red]")
             return True
 
+        if cmd == "/connectors":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "list":
+                t = Table("Connector", "Status", title="Connectors")
+                for name, status in self.connectors.list():
+                    color = "green" if status == "running" else "dim"
+                    t.add_row(name, f"[{color}]{status}[/{color}]")
+                console.print(t)
+            elif sub == "enable" and len(parts) >= 3:
+                msg = await self.connectors.enable(
+                    parts[2].lower(), self.config, self.workspace, self.registry
+                )
+                console.print(f"[green]{msg}[/green]" if "started" in msg else f"[red]{msg}[/red]")
+            elif sub == "disable" and len(parts) >= 3:
+                msg = await self.connectors.disable(parts[2].lower())
+                console.print(f"[yellow]{msg}[/yellow]" if "stopped" in msg else f"[red]{msg}[/red]")
+            else:
+                console.print("[red]Usage: /connectors list|enable <name>|disable <name>[/red]")
+            return True
+
+        if cmd == "/skills":
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            from lightclaw.tools.skills import _load as _skills_load, _save as _skills_save
+            from lightclaw.tools.skills import Skill as _Skill, _extract_params, _fetch_registry
+            if sub == "list":
+                skills = _skills_load()
+                if not skills:
+                    console.print("[dim]No skills installed. Try /skills search <query>[/dim]")
+                else:
+                    t = Table("ID", "Description", "Params", title="Installed Skills")
+                    for s in skills:
+                        t.add_row(s.id, s.description, ", ".join(s.params) or "—")
+                    console.print(t)
+            elif sub == "search" and len(parts) >= 3:
+                query = parts[2].lower()
+                with console.status("Fetching registry..."):
+                    data = await _fetch_registry()
+                if isinstance(data, str):
+                    console.print(f"[red]{data}[/red]")
+                else:
+                    matches = [s for s in data if query in s["id"].lower() or query in s.get("description", "").lower()]
+                    if not matches:
+                        console.print(f"[yellow]No results for {query!r}[/yellow]")
+                    else:
+                        t = Table("ID", "Description", "Params", title=f"Registry: {query!r}")
+                        for s in matches:
+                            params = s.get("params") or _extract_params(s.get("prompt", ""))
+                            t.add_row(s["id"], s.get("description", ""), ", ".join(params) or "—")
+                        console.print(t)
+            elif sub == "install" and len(parts) >= 3:
+                skill_id = parts[2]
+                with console.status(f"Installing '{skill_id}'..."):
+                    data = await _fetch_registry()
+                if isinstance(data, str):
+                    console.print(f"[red]{data}[/red]")
+                else:
+                    entry = next((s for s in data if s["id"] == skill_id), None)
+                    if entry is None:
+                        console.print(f"[red]'{skill_id}' not found in registry[/red]")
+                        console.print(f"[dim]Try: /skills search <keyword>[/dim]")
+                    else:
+                        params = _extract_params(entry["prompt"])
+                        skills = _skills_load()
+                        skills = [s for s in skills if s.id != skill_id]
+                        skills.append(_Skill(
+                            id=entry["id"],
+                            description=entry["description"],
+                            prompt=entry["prompt"],
+                            params=params,
+                        ))
+                        _skills_save(skills)
+                        param_str = f"  params: {params}" if params else ""
+                        console.print(f"[green]Installed:[/green] {skill_id}{param_str}")
+            elif sub == "remove" and len(parts) >= 3:
+                skill_id = parts[2]
+                skills = _skills_load()
+                before = len(skills)
+                skills = [s for s in skills if s.id != skill_id]
+                if len(skills) == before:
+                    console.print(f"[red]Skill '{skill_id}' not found[/red]")
+                else:
+                    _skills_save(skills)
+                    console.print(f"[green]Removed:[/green] {skill_id}")
+            elif sub == "run" and len(parts) >= 3:
+                skill_id = parts[2]
+                # parse remaining tokens as key=value pairs
+                raw_params = line.strip().split(None)[3:]
+                params: dict[str, str] = {}
+                for token in raw_params:
+                    k, _, v = token.partition("=")
+                    if k:
+                        params[k] = v
+                skills = _skills_load()
+                skill = next((s for s in skills if s.id == skill_id), None)
+                if skill is None:
+                    console.print(f"[red]Skill '{skill_id}' not installed[/red]")
+                else:
+                    try:
+                        prompt = skill.prompt.format(**params)
+                    except KeyError as exc:
+                        console.print(f"[red]Missing param {exc.args[0]!r} — required: {skill.params}[/red]")
+                    else:
+                        response = await self.agent.run(prompt, thread_id=f"skill_{skill_id}")
+                        console.print(Markdown(response))
+            else:
+                console.print("[red]Usage: /skills list|search <q>|install <id>|remove <id>|run <id> [key=val ...][/red]")
+            return True
+
         if cmd == "/schedule":
             sub = parts[1].lower() if len(parts) > 1 else ""
             if sub == "list":
@@ -322,6 +631,15 @@ class ReplSession:
         return False
 
 
+def _make_image_attachment(data: bytes, mime: str) -> dict[str, Any]:
+    return {
+        "type": "image",
+        "data": data,
+        "mime_type": mime,
+        "filename": f"clipboard.{'png' if 'png' in mime else 'jpg'}",
+    }
+
+
 async def _repl(config: Config) -> None:
     session = ReplSession(config)
     await session.start()
@@ -331,27 +649,131 @@ async def _repl(config: Config) -> None:
         f"model=[yellow]{config.model}[/yellow]  "
         f"base=[yellow]{config.base_url}[/yellow]  "
         f"db=[yellow]{config.db_path}[/yellow]\n"
-        "Type [cyan]/help[/cyan] for commands or [cyan]/quit[/cyan] to exit.",
+        "Type [cyan]/help[/cyan] for commands or [cyan]/quit[/cyan] to exit.\n"
+        "Paste images with [cyan]Ctrl+Y[/cyan] or [cyan]/paste[/cyan].",
         title="light-claw",
         border_style="cyan",
     ))
 
+    _pending_image_attachments: list[dict[str, Any]] = []
+
+    def _toolbar() -> _HTML:
+        stats = session.agent.token_stats
+        total = stats.get("total", 0)
+        ctx_known = session.agent.context_length is not None
+        ctx = session.agent.context_length or 128_000
+        pct = min(total / ctx * 100, 100) if total else 0.0
+        bar_w = 20
+        filled = round(pct / 100 * bar_w)
+        bar = "█" * filled + " " * (bar_w - filled)
+        color = "ansigreen" if pct < 50 else "ansiyellow" if pct < 80 else "ansired"
+        est = "~" if not ctx_known else ""
+        tok_label = f"{est}{total/1000:.1f}K/{ctx/1000:.1f}K"
+        ttft_str = f"  ttft {session.last_ttft:.2f}s" if session.last_ttft is not None else ""
+        attach_str = f"  📎 {len(_pending_image_attachments)}" if _pending_image_attachments else ""
+        return _HTML(
+            f" {tok_label}"
+            f"  [<style fg='{color}'>{bar}</style>]"
+            f"{ttft_str}{attach_str}"
+        )
+
+    def _routines_panel() -> Text:
+        t = Text()
+        t.append("jobs\n", style="cyan bold")
+        t.append("─" * 20 + "\n", style="dim")
+        jobs = session.job_manager.list_all(limit=8)
+        for j in jobs:
+            if j.status == "completed":
+                icon, style = "✓", "green"
+            elif j.status == "failed":
+                icon, style = "✗", "red"
+            else:
+                icon, style = "⏳", "cyan"
+            name = j.id if len(j.id) <= 20 else j.id[:17] + "..."
+            t.append(f"{icon} ", style=style)
+            t.append(f"{name}\n", style="dim")
+            t.append(f"  {j.elapsed}\n", style="dim")
+        if not jobs:
+            t.append("no jobs yet", style="dim")
+        return t
+
+    kb = _KB()
+
+    @kb.add("c-y")
+    def _paste_image_from_clipboard(event) -> None:
+        result = _read_clipboard_image()
+        if result is not None:
+            data, mime = result
+            _pending_image_attachments.append(_make_image_attachment(data, mime))
+            event.app.invalidate()
+
+    pt_session: _PTSession = _PTSession(
+        completer=_SlashCompleter(),
+        bottom_toolbar=_toolbar,
+        complete_while_typing=True,
+        complete_in_thread=True,
+        key_bindings=kb,
+        style=_PTStyle.from_dict({
+            "bottom-toolbar": "noreverse bg:#111111 #666666",
+            "bottom-toolbar.text": "noreverse bg:#111111 #666666",
+        }),
+    )
+
     try:
         while True:
             try:
-                line = Prompt.ask(f"[bold cyan]({session.thread_id})[/bold cyan]")
+                line = await pt_session.prompt_async(
+                    _HTML(f"<ansibrightcyan><b>({session.thread_id})</b></ansibrightcyan> "),
+                )
             except (EOFError, KeyboardInterrupt):
                 break
             if not line.strip():
                 continue
+
+            # Handle /paste before generic slash dispatch (needs _pending_image_attachments).
+            if line.strip().lower().startswith("/paste"):
+                sub = line.strip().split(None, 1)[1].lower() if len(line.strip().split(None)) > 1 else ""
+                if sub == "clear":
+                    _pending_image_attachments.clear()
+                    console.print("[yellow]Pending attachments cleared.[/yellow]")
+                else:
+                    result = await asyncio.to_thread(_read_clipboard_image)
+                    if result is not None:
+                        data, mime = result
+                        _pending_image_attachments.append(_make_image_attachment(data, mime))
+                        n = len(_pending_image_attachments)
+                        console.print(
+                            f"[green]Attached[/green] {mime} image "
+                            f"({len(data):,} bytes)  —  {n} pending"
+                        )
+                    else:
+                        console.print("[yellow]No image in clipboard.[/yellow]")
+                continue
+
+            # /suggest — replace with a canned analysis prompt, then fall through to agent.
+            if line.strip().lower() == "/suggest":
+                line = (
+                    "Use lightclaw_read_source to explore your own source code and identify "
+                    "concrete improvements. Start with the project structure (''), then read "
+                    "the most relevant modules. Produce a prioritised list of 3–5 specific, "
+                    "actionable suggestions (bugs first, then UX friction, then missing "
+                    "features). For each: state what the problem is, where in the code it "
+                    "lives, and what the fix would be."
+                )
+                # fall through to agent stream below
+
             if line.startswith("/"):
                 try:
                     await session.handle_slash(line)
                 except KeyboardInterrupt:
                     break
                 continue
-            line, attachments = _parse_attachments(line)
-            if not line and not attachments:
+
+            line, text_attachments = _parse_attachments(line)
+            all_attachments = list(_pending_image_attachments) + text_attachments
+            _pending_image_attachments.clear()
+
+            if not line and not all_attachments:
                 continue
 
             stats_before = dict(session.agent.token_stats)
@@ -371,27 +793,38 @@ async def _repl(config: Config) -> None:
                 else:
                     approx = max(1, chunk_chars // 4)
                     tok_part = f"~{approx:,} tok"
-                line = Text(style="dim")
-                line.append(f"ttft {ttft}  {tok_part}  session {session_total:,}  ")
                 pct = min(session_total / ctx * 100, 100)
                 bar_width = 20
                 filled = round(pct / 100 * bar_width)
-                bar = "█" * filled + "░" * (bar_width - filled)
+                bar = "█" * filled + " " * (bar_width - filled)
                 bar_style = "green" if pct < 50 else "yellow" if pct < 80 else "red"
-                pct_label = f"~{pct:.1f}%" if not ctx_known else f"{pct:.1f}%"
+                est = "~" if not ctx_known else ""
+                tok_label = f"{est}{session_total/1000:.1f}K/{ctx/1000:.1f}K"
+                line = Text(style="dim")
+                line.append(f"ttft {ttft}  {tok_part}  {tok_label}  ")
                 line.append("[", style="dim")
                 line.append(bar, style=bar_style)
-                line.append(f"] {pct_label}", style="dim")
+                line.append("]", style="dim")
                 return line
 
             live = Live(console=console, refresh_per_second=15)
             live.start()
             _live_stopped = False
 
+            def _live_grid(main, sidebar) -> Table:
+                grid = Table.grid(padding=(0, 1), expand=True)
+                grid.add_column(ratio=3)
+                grid.add_column(ratio=1, min_width=22)
+                grid.add_row(main, sidebar)
+                return grid
+
             async def _tick() -> None:
                 while first_token_time is None:
                     elapsed = time.perf_counter() - start_time
-                    live.update(Text(f"⏱ {elapsed:.1f}s", style="dim"))
+                    live.update(_live_grid(
+                        Text(f"⏱ {elapsed:.1f}s", style="dim"),
+                        _routines_panel(),
+                    ))
                     await asyncio.sleep(0.05)
 
             async def _confirm_with_live(
@@ -419,7 +852,7 @@ async def _repl(config: Config) -> None:
 
             try:
                 async for chunk in session.agent.stream(
-                    line, thread_id=session.thread_id, attachments=attachments or None
+                    line, thread_id=session.thread_id, attachments=all_attachments or None
                 ):
                     if not chunk:
                         continue
@@ -428,7 +861,10 @@ async def _repl(config: Config) -> None:
                     response_text += chunk
                     chunk_chars += len(chunk)
                     if not _live_stopped:
-                        live.update(Group(Markdown(response_text), _status_line()))
+                        live.update(Group(
+                            _live_grid(Markdown(response_text), _routines_panel()),
+                            _status_line(),
+                        ))
                     else:
                         console.print(chunk, end="", highlight=False)
             except Exception:
@@ -438,13 +874,15 @@ async def _repl(config: Config) -> None:
                 raise
             else:
                 tick_task.cancel()
+                session.last_ttft = first_token_time
                 stats_after = session.agent.token_stats
                 msg_tok = stats_after.get("completion", 0) - stats_before.get("completion", 0)
                 if not _live_stopped:
                     if response_text:
-                        live.update(
-                            Group(Markdown(response_text), _status_line(exact_msg=msg_tok))
-                        )
+                        live.update(Group(
+                            _live_grid(Markdown(response_text), _routines_panel()),
+                            _status_line(exact_msg=msg_tok),
+                        ))
                     live.stop()
                 else:
                     console.print()
@@ -1049,6 +1487,187 @@ def routines_disable(routine_id: Annotated[str, typer.Argument()]) -> None:
     from lightclaw.routines import RoutineEngine as _RE
     ok = _RE().set_enabled(routine_id, False)
     console.print("[green]Disabled.[/green]" if ok else f"[red]Not found: {routine_id!r}[/red]")
+
+
+# ---------------------------------------------------------------------------
+# Skills CLI
+# ---------------------------------------------------------------------------
+
+@skills_app.command("list")
+def skills_list() -> None:
+    """List locally installed skills."""
+    from lightclaw.tools.skills import _load as _sl
+    skills = _sl()
+    if not skills:
+        console.print("[dim]No skills installed. Try: lightclaw skills search <keyword>[/dim]")
+        return
+    t = Table("ID", "Description", "Params", title="Installed Skills")
+    for s in skills:
+        t.add_row(s.id, s.description, ", ".join(s.params) or "—")
+    console.print(t)
+
+
+@skills_app.command("search")
+def skills_search(
+    query: Annotated[str, typer.Argument(help="Keyword to search")],
+) -> None:
+    """Search the remote skills registry."""
+    from lightclaw.tools.skills import _fetch_registry, _extract_params
+
+    async def _go() -> None:
+        data = await _fetch_registry()
+        if isinstance(data, str):
+            console.print(f"[red]{data}[/red]")
+            return
+        q = query.lower()
+        matches = [
+            s for s in data
+            if q in s["id"].lower() or q in s.get("description", "").lower()
+        ]
+        if not matches:
+            console.print(f"[yellow]No results for {query!r}[/yellow]")
+            return
+        t = Table("ID", "Description", "Params", title=f"Registry: {query!r}")
+        for s in matches:
+            params = s.get("params") or _extract_params(s.get("prompt", ""))
+            t.add_row(s["id"], s.get("description", ""), ", ".join(params) or "—")
+        console.print(t)
+
+    asyncio.run(_go())
+
+
+@skills_app.command("browse")
+def skills_browse() -> None:
+    """List all skills in the remote registry."""
+    from lightclaw.tools.skills import _fetch_registry, _extract_params
+
+    async def _go() -> None:
+        data = await _fetch_registry()
+        if isinstance(data, str):
+            console.print(f"[red]{data}[/red]")
+            return
+        t = Table("ID", "Description", "Params", title="Skills Registry")
+        for s in data:
+            params = s.get("params") or _extract_params(s.get("prompt", ""))
+            t.add_row(s["id"], s.get("description", ""), ", ".join(params) or "—")
+        console.print(t)
+
+    asyncio.run(_go())
+
+
+@skills_app.command("install")
+def skills_install(
+    skill_id: Annotated[str, typer.Argument(help="Skill ID to install")],
+) -> None:
+    """Download and install a skill from the registry."""
+    from lightclaw.tools.skills import _fetch_registry, _load as _sl, _save as _ss, Skill as _SK, _extract_params
+
+    async def _go() -> None:
+        with console.status(f"Fetching registry..."):
+            data = await _fetch_registry()
+        if isinstance(data, str):
+            console.print(f"[red]{data}[/red]")
+            return
+        entry = next((s for s in data if s["id"] == skill_id), None)
+        if entry is None:
+            console.print(f"[red]Skill '{skill_id}' not found in registry.[/red]")
+            console.print("[dim]Try: lightclaw skills browse[/dim]")
+            return
+        params = _extract_params(entry["prompt"])
+        skills = _sl()
+        skills = [s for s in skills if s.id != skill_id]
+        skills.append(_SK(
+            id=entry["id"],
+            description=entry["description"],
+            prompt=entry["prompt"],
+            params=params,
+        ))
+        _ss(skills)
+        console.print(f"[green]Installed:[/green] {skill_id}")
+        if params:
+            console.print(f"[dim]Params: {params}[/dim]")
+        console.print(f"[dim]Run with: lightclaw skills run {skill_id}{' ' + ' '.join(p+'=<value>' for p in params) if params else ''}[/dim]")
+
+    asyncio.run(_go())
+
+
+@skills_app.command("remove")
+def skills_remove(
+    skill_id: Annotated[str, typer.Argument(help="Skill ID to remove")],
+) -> None:
+    """Remove an installed skill."""
+    from lightclaw.tools.skills import _load as _sl, _save as _ss
+    skills = _sl()
+    before = len(skills)
+    skills = [s for s in skills if s.id != skill_id]
+    if len(skills) == before:
+        console.print(f"[red]Skill '{skill_id}' not found.[/red]")
+        raise typer.Exit(1)
+    _ss(skills)
+    console.print(f"[green]Removed:[/green] {skill_id}")
+
+
+@skills_app.command("show")
+def skills_show(
+    skill_id: Annotated[str, typer.Argument(help="Skill ID to inspect")],
+) -> None:
+    """Show full details of an installed skill."""
+    from lightclaw.tools.skills import _load as _sl
+    skill = next((s for s in _sl() if s.id == skill_id), None)
+    if skill is None:
+        console.print(f"[red]Skill '{skill_id}' not installed.[/red]")
+        raise typer.Exit(1)
+    console.print(Panel(
+        f"[bold]Description:[/bold] {skill.description}\n"
+        f"[bold]Params:[/bold] {skill.params or '(none)'}\n\n"
+        f"[bold]Prompt:[/bold]\n{skill.prompt}",
+        title=f"Skill: {skill.id}",
+        border_style="cyan",
+    ))
+
+
+@skills_app.command("run")
+def skills_run(
+    skill_id: Annotated[str, typer.Argument(help="Skill ID to run")],
+    params: Annotated[list[str], typer.Argument(help="key=value params")] = [],
+    model: Annotated[str | None, typer.Option("--model", "-m")] = None,
+) -> None:
+    """Run an installed skill. Pass params as key=value arguments.
+
+    Example:
+      lightclaw skills run summarize text="hello world" audience="children"
+    """
+    from lightclaw.tools.skills import _load as _sl, _extract_params
+
+    skill = next((s for s in _sl() if s.id == skill_id), None)
+    if skill is None:
+        console.print(f"[red]Skill '{skill_id}' not installed.[/red]")
+        raise typer.Exit(1)
+
+    param_dict: dict[str, str] = {}
+    for token in params:
+        k, _, v = token.partition("=")
+        if k:
+            param_dict[k] = v
+
+    try:
+        prompt = skill.prompt.format(**param_dict)
+    except KeyError as exc:
+        console.print(f"[red]Missing param {exc.args[0]!r} — required: {skill.params}[/red]")
+        raise typer.Exit(1)
+
+    cfg = get_config()
+    if model:
+        cfg.model = model
+        set_config(cfg)
+
+    async def _go() -> None:
+        async with Workspace(cfg) as ws:
+            agent = AgentLoop(cfg, get_default_registry(), ws)
+            response = await agent.run(prompt, thread_id=f"skill_{skill_id}")
+            console.print(Markdown(response))
+
+    asyncio.run(_go())
 
 
 @app.callback(invoke_without_command=True)
